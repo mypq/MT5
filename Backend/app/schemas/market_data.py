@@ -238,12 +238,17 @@ class AccountSnapshot(StrictModel):
     ) -> str:
         return validate_source_identifier(value)
 
-    @field_validator("account_currency")
+    @field_validator("account_currency", mode="before")
     @classmethod
     def normalize_currency(
         cls,
         value: str,
     ) -> str:
+        if not isinstance(value, str):
+            raise ValueError(
+                "Account currency must be text"
+            )
+
         normalized = value.strip().upper()
 
         if (
