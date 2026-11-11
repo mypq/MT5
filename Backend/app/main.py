@@ -4,9 +4,11 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.market_data import router as market_data_router
 from app.core.config import settings
 from app.core.device_registry import DeviceRegistry
 from app.core.device_secret_crypto import DeviceSecretCipher
+from app.core.market_data_store import MarketDataStore
 from app.core.postgres_nonce_store import PostgresNonceStore
 
 
@@ -19,6 +21,7 @@ async def lifespan(app: FastAPI):
     app.state.database_status = "NOT_CONNECTED"
     app.state.device_registry = None
     app.state.nonce_store = None
+    app.state.market_data_store = None
 
     logger.info("GOLD BOT backend starting")
 
@@ -36,21 +39,27 @@ async def lifespan(app: FastAPI):
             cipher = DeviceSecretCipher(encryption_key)
 
             nonce_store = PostgresNonceStore(database_url)
+
             device_registry = DeviceRegistry(
                 database_url=database_url,
                 cipher=cipher,
             )
 
-            # Fail startup if either security store cannot initialize.
+            market_data_store = MarketDataStore(database_url)
+
+            # All security and persistence stores must initialize
+            # successfully before the API accepts market data.
             await nonce_store.initialize()
             await device_registry.initialize()
+            await market_data_store.initialize()
 
             app.state.nonce_store = nonce_store
             app.state.device_registry = device_registry
+            app.state.market_data_store = market_data_store
             app.state.database_status = "CONNECTED"
 
             logger.info(
-                "Market-data security stores initialized"
+                "Market-data security and storage initialized"
             )
         else:
             app.state.database_status = "DISABLED"
@@ -59,9 +68,11 @@ async def lifespan(app: FastAPI):
 
     except Exception:
         app.state.database_status = "ERROR"
+
         logger.exception(
             "GOLD BOT backend startup or runtime failure"
         )
+
         raise
 
     finally:
@@ -79,6 +90,9 @@ app = FastAPI(
     redoc_url=None,
     lifespan=lifespan,
 )
+
+
+app.include_router(market_data_router)
 
 
 @app.get("/", tags=["System"])
@@ -99,17 +113,21 @@ async def health():
         "NOT_INITIALIZED",
     )
 
+    ingestion_enabled = (
+        settings.MARKET_DATA_INGESTION_ENABLED
+    )
+
+    healthy = (
+        database_status == "CONNECTED"
+        if ingestion_enabled
+        else database_status == "DISABLED"
+    )
+
     return {
-        "status": (
-            "healthy"
-            if database_status != "ERROR"
-            else "unhealthy"
-        ),
+        "status": "healthy" if healthy else "unhealthy",
         "service": "gold-bot-backend",
         "database_status": database_status,
-        "market_data_ingestion_enabled": (
-            settings.MARKET_DATA_INGESTION_ENABLED
-        ),
+        "market_data_ingestion_enabled": ingestion_enabled,
         "shutting_down": getattr(
             app.state,
             "shutting_down",
@@ -126,6 +144,16 @@ async def system_status():
         "NOT_INITIALIZED",
     )
 
+    ingestion_enabled = (
+        settings.MARKET_DATA_INGESTION_ENABLED
+    )
+
+    backend_healthy = (
+        database_status == "CONNECTED"
+        if ingestion_enabled
+        else database_status == "DISABLED"
+    )
+
     return {
         "application": settings.APP_NAME,
         "version": settings.APP_VERSION,
@@ -134,14 +162,10 @@ async def system_status():
         "automated_trading_enabled": (
             settings.AUTOMATED_TRADING_ENABLED
         ),
-        "market_data_ingestion_enabled": (
-            settings.MARKET_DATA_INGESTION_ENABLED
-        ),
+        "market_data_ingestion_enabled": ingestion_enabled,
         "analysis_mode_available": True,
         "backend_status": (
-            "running"
-            if database_status != "ERROR"
-            else "unhealthy"
+            "running" if backend_healthy else "unhealthy"
         ),
         "database_status": database_status,
         "device_registry_status": (
@@ -152,6 +176,11 @@ async def system_status():
         "nonce_store_status": (
             "initialized"
             if app.state.nonce_store is not None
+            else "disabled"
+        ),
+        "market_data_store_status": (
+            "initialized"
+            if app.state.market_data_store is not None
             else "disabled"
         ),
         "mt5_connection_status": "NOT_CONNECTED",
