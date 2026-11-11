@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from typing import Literal
 
@@ -46,6 +47,16 @@ class Settings(BaseSettings):
 
     DEMO_ONLY: bool = True
     AUTOMATED_TRADING_ENABLED: bool = False
+
+    # Market-data ingestion remains disabled until the
+    # device registry and authenticated API are integrated.
+    MARKET_DATA_INGESTION_ENABLED: bool = False
+
+    # Exactly 32 bytes represented as 64 hexadecimal characters.
+    # This key is used for AES-256-GCM device-secret encryption.
+    DEVICE_SECRET_ENCRYPTION_KEY: SecretStr = SecretStr(
+        "CHANGE_ME_BEFORE_DEPLOYMENT"
+    )
 
     MAX_RISK_PER_TRADE_PERCENT: float = Field(
         default=0.5,
@@ -96,6 +107,25 @@ class Settings(BaseSettings):
 
         return value
 
+    @field_validator("DEVICE_SECRET_ENCRYPTION_KEY")
+    @classmethod
+    def validate_device_encryption_key(
+        cls,
+        value: SecretStr,
+    ) -> SecretStr:
+        key = value.get_secret_value()
+
+        if key == "CHANGE_ME_BEFORE_DEPLOYMENT":
+            return value
+
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", key):
+            raise ValueError(
+                "DEVICE_SECRET_ENCRYPTION_KEY must be "
+                "exactly 64 hexadecimal characters"
+            )
+
+        return value
+
     @field_validator("DATABASE_URL")
     @classmethod
     def validate_database_url(
@@ -116,6 +146,17 @@ class Settings(BaseSettings):
                 "GOLD BOT is restricted to DEMO accounts"
             )
 
+        if self.MARKET_DATA_INGESTION_ENABLED:
+            encryption_key = (
+                self.DEVICE_SECRET_ENCRYPTION_KEY.get_secret_value()
+            )
+
+            if encryption_key == "CHANGE_ME_BEFORE_DEPLOYMENT":
+                raise ValueError(
+                    "Device secret encryption key is required "
+                    "when market-data ingestion is enabled"
+                )
+
         if self.APP_ENV == "production":
             jwt_secret = self.JWT_SECRET.get_secret_value()
             backend_key = self.BACKEND_API_KEY.get_secret_value()
@@ -135,6 +176,17 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "DATABASE_URL must be configured in production"
                 )
+
+            if self.MARKET_DATA_INGESTION_ENABLED:
+                encryption_key = (
+                    self.DEVICE_SECRET_ENCRYPTION_KEY.get_secret_value()
+                )
+
+                if encryption_key == "CHANGE_ME_BEFORE_DEPLOYMENT":
+                    raise ValueError(
+                        "DEVICE_SECRET_ENCRYPTION_KEY must be "
+                        "configured in production"
+                    )
 
         return self
 
