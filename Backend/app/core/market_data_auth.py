@@ -10,10 +10,7 @@ from app.core.market_data_security import (
     SecurityVerificationError,
     verify_signed_request,
 )
-from app.core.postgres_nonce_store import (
-    NonceStoreError,
-    PostgresNonceStore,
-)
+from app.core.postgres_nonce_store import PostgresNonceStore
 
 
 class MarketDataAuthenticationError(Exception):
@@ -28,7 +25,9 @@ def _reject_duplicate_json_keys(pairs):
 
     for key, value in pairs:
         if key in result:
-            raise ValueError("Duplicate JSON keys are not allowed")
+            raise ValueError(
+                "Duplicate JSON keys are not allowed"
+            )
 
         result[key] = value
 
@@ -53,8 +52,7 @@ async def authenticate_market_data_request(
     The HMAC covers the HTTP method, URL path, timestamp,
     device identifier, nonce, and exact raw request body.
 
-    Query parameters are rejected to prevent unsigned
-    request-target ambiguity.
+    Query parameters are rejected.
     """
 
     if request.method != "POST":
@@ -158,7 +156,6 @@ async def authenticate_market_data_request(
     except (
         ValueError,
         UnicodeDecodeError,
-        json.JSONDecodeError,
     ) as exc:
         raise MarketDataAuthenticationError(
             "Request body must contain valid JSON without duplicate keys"
@@ -208,10 +205,6 @@ async def authenticate_market_data_request(
     except SecurityVerificationError as exc:
         raise MarketDataAuthenticationError(
             "Market-data request authentication failed"
-        ) from exc
-    except NonceStoreError as exc:
-        raise MarketDataAuthenticationError(
-            "Replay protection is unavailable"
         ) from exc
 
     return raw_body
