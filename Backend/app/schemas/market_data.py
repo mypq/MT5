@@ -2,7 +2,6 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from math import isfinite
 from typing import Literal
 from uuid import UUID
 
@@ -61,6 +60,24 @@ def require_aware_datetime(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def reject_future_datetime(value: datetime, field_name: str) -> datetime:
+    normalized = require_aware_datetime(value)
+
+    if normalized > datetime.now(timezone.utc):
+        raise ValueError(f"{field_name} cannot be in the future")
+
+    return normalized
+
+
+def validate_source_identifier(value: str) -> str:
+    normalized = value.strip()
+
+    if not normalized:
+        raise ValueError("Source ID cannot be empty")
+
+    return normalized
+
+
 class MarketCandle(StrictModel):
     open_time: datetime
 
@@ -71,7 +88,6 @@ class MarketCandle(StrictModel):
 
     tick_volume: int = Field(ge=0)
     real_volume: int = Field(ge=0)
-
     spread_points: int = Field(ge=0)
 
     is_closed: Literal[True]
@@ -84,19 +100,13 @@ class MarketCandle(StrictModel):
     @model_validator(mode="after")
     def validate_ohlc(self):
         if self.high < max(self.open, self.close):
-            raise ValueError(
-                "Candle high cannot be below open or close"
-            )
+            raise ValueError("Candle high cannot be below open or close")
 
         if self.low > min(self.open, self.close):
-            raise ValueError(
-                "Candle low cannot be above open or close"
-            )
+            raise ValueError("Candle low cannot be above open or close")
 
         if self.high < self.low:
-            raise ValueError(
-                "Candle high cannot be below candle low"
-            )
+            raise ValueError("Candle high cannot be below candle low")
 
         return self
 
@@ -104,10 +114,7 @@ class MarketCandle(StrictModel):
 class MarketDataBatch(StrictModel):
     message_id: UUID
 
-    source_id: str = Field(
-        min_length=1,
-        max_length=128,
-    )
+    source_id: str = Field(min_length=1, max_length=128)
 
     signature: str = Field(
         min_length=64,
@@ -116,9 +123,7 @@ class MarketDataBatch(StrictModel):
     )
 
     symbol: Literal["XAUUSD"] = "XAUUSD"
-
     timeframe: MarketTimeframe
-
     sent_at: datetime
 
     volume_source: VolumeSource = VolumeSource.UNKNOWN
@@ -131,46 +136,25 @@ class MarketDataBatch(StrictModel):
     @field_validator("sent_at")
     @classmethod
     def validate_sent_at(cls, value: datetime) -> datetime:
-        return require_aware_datetime(value)
+        return reject_future_datetime(value, "sent_at")
 
     @field_validator("source_id")
     @classmethod
     def validate_source_id(cls, value: str) -> str:
-        value = value.strip()
-
-        if not value:
-            raise ValueError("Source ID cannot be empty")
-
-        return value
+        return validate_source_identifier(value)
 
     @model_validator(mode="after")
     def validate_candle_sequence(self):
-        timestamps = [
-            candle.open_time
-            for candle in self.candles
-        ]
+        timestamps = [candle.open_time for candle in self.candles]
 
         if timestamps != sorted(timestamps):
-            raise ValueError(
-                "Candles must be ordered chronologically"
-            )
+            raise ValueError("Candles must be ordered chronologically")
 
         if len(timestamps) != len(set(timestamps)):
-            raise ValueError(
-                "Duplicate candle timestamps are not allowed"
-            )
-
-        now = datetime.now(timezone.utc)
-
-        if self.sent_at > now:
-            raise ValueError(
-                "Market data sent_at cannot be in the future"
-            )
+            raise ValueError("Duplicate candle timestamps are not allowed")
 
         if timestamps[-1] > self.sent_at:
-            raise ValueError(
-                "Latest candle cannot start after sent_at"
-            )
+            raise ValueError("Latest candle cannot start after sent_at")
 
         return self
 
@@ -178,10 +162,7 @@ class MarketDataBatch(StrictModel):
 class AccountSnapshot(StrictModel):
     message_id: UUID
 
-    source_id: str = Field(
-        min_length=1,
-        max_length=128,
-    )
+    source_id: str = Field(min_length=1, max_length=128)
 
     signature: str = Field(
         min_length=64,
@@ -194,6 +175,7 @@ class AccountSnapshot(StrictModel):
     account_currency: str = Field(
         min_length=3,
         max_length=12,
+        pattern=r"^[A-Z]{3,12}$",
     )
 
     balance: float = Field(ge=0)
@@ -206,39 +188,36 @@ class AccountSnapshot(StrictModel):
 
     daily_realized_loss: float = Field(ge=0)
 
-    positions_count: int = Field(
-        ge=0,
-        le=1000,
-    )
+    positions_count: int = Field(ge=0, le=1000)
 
     sent_at: datetime
 
     @field_validator("sent_at")
     @classmethod
     def validate_sent_at(cls, value: datetime) -> datetime:
-        return require_aware_datetime(value)
+        return reject_future_datetime(value, "sent_at")
 
     @field_validator("source_id")
     @classmethod
     def validate_source_id(cls, value: str) -> str:
-        value = value.strip()
-
-        if not value:
-            raise ValueError("Source ID cannot be empty")
-
-        return value
+        return validate_source_identifier(value)
 
     @field_validator("account_currency")
     @classmethod
     def normalize_currency(cls, value: str) -> str:
-        value = value.strip().upper()
+        normalized = value.strip().upper()
 
-        if not value.isalpha():
+        if not normalized.isascii() or not normalized.isalpha():
             raise ValueError(
-                "Account currency must contain letters only"
+                "Account currency must contain ASCII letters only"
             )
 
-        return value
+        if not 3 <= len(normalized) <= 12:
+            raise ValueError(
+                "Account currency length must be between 3 and 12"
+            )
+
+        return normalized
 
 
 class OpenPosition(StrictModel):
@@ -278,21 +257,18 @@ class OpenPosition(StrictModel):
     @field_validator("position_id")
     @classmethod
     def validate_position_id(cls, value: str) -> str:
-        value = value.strip()
+        normalized = value.strip()
 
-        if not value:
+        if not normalized:
             raise ValueError("Position ID cannot be empty")
 
-        return value
+        return normalized
 
 
 class OpenPositionsSnapshot(StrictModel):
     message_id: UUID
 
-    source_id: str = Field(
-        min_length=1,
-        max_length=128,
-    )
+    source_id: str = Field(min_length=1, max_length=128)
 
     signature: str = Field(
         min_length=64,
@@ -309,35 +285,29 @@ class OpenPositionsSnapshot(StrictModel):
     @field_validator("sent_at")
     @classmethod
     def validate_sent_at(cls, value: datetime) -> datetime:
-        return require_aware_datetime(value)
+        return reject_future_datetime(value, "sent_at")
 
     @field_validator("source_id")
     @classmethod
     def validate_source_id(cls, value: str) -> str:
-        value = value.strip()
-
-        if not value:
-            raise ValueError("Source ID cannot be empty")
-
-        return value
+        return validate_source_identifier(value)
 
     @model_validator(mode="after")
-    def validate_unique_positions(self):
-        if self.sent_at > datetime.now(timezone.utc):
-            raise ValueError(
-                "Snapshot timestamp cannot be in the future"
-            )
-
+    def validate_positions(self):
         position_ids = [
             position.position_id
             for position in self.positions
         ]
 
         if len(position_ids) != len(set(position_ids)):
-            raise ValueError(
-                "Duplicate position IDs are not allowed"
-            )
+            raise ValueError("Duplicate position IDs are not allowed")
+
+        for position in self.positions:
+            if position.opened_at > self.sent_at:
+                raise ValueError(
+                    "Position opened_at cannot be after snapshot sent_at"
+                )
 
         return self
 
-ملاحظة أمنية: التحقق من شكل التوقيع هنا لا يتحقق من صحته التشفيرية. يجب التحقق من HMAC ومصدر الجهاز ومنع إعادة إرسال الرسائل القديمة في طبقة الاستقبال قبل اعتماد أي بيانات.
+ملاحظة أمنية مهمة: فحص صيغة "signature" لا يثبت صحة التوقيع. لا يجوز اعتماد أي بيانات قبل التحقق الفعلي من HMAC وهوية الجهاز ومنع إعادة إرسال الرسائل القديمة في طبقة الاستقبال.
