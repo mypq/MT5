@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.00"
-#property description "GOLD BOT - Demo-only XAUUSD market data connector"
+#property version   "1.01"
+#property description "GOLD BOT - DEMO-only XAUUSD market data connector"
 
 input string InpBackendBaseUrl = "https://YOUR_BACKEND_DOMAIN";
 input string InpSourceId = "MT5-DEMO-01";
@@ -18,6 +18,7 @@ input int InpRequestTimeoutMs = 10000;
 
 long g_nonce_counter = 0;
 int g_symbol_digits = 2;
+string g_backend_url = "";
 
 //+------------------------------------------------------------------+
 //| Convert text to exact UTF-8 bytes                                |
@@ -37,10 +38,7 @@ StringLen(value),
 CP_UTF8
 );
 
-if(count <= 0)
-return false;
-
-return ArraySize(output) == count;
+return count > 0 && ArraySize(output) == count;
 }
 
 //+------------------------------------------------------------------+
@@ -98,7 +96,12 @@ if(ArraySize(secret) < 32)
 return false;
 
 uchar key_block[];
-ArrayResize(key_block, GOLD_BOT_HMAC_BLOCK_SIZE);
+
+ArrayResize(
+key_block,
+GOLD_BOT_HMAC_BLOCK_SIZE
+);
+
 ArrayInitialize(key_block, 0);
 
 if(ArraySize(secret) > GOLD_BOT_HMAC_BLOCK_SIZE)
@@ -143,12 +146,19 @@ outer_pad[i] = (uchar)(key_block[i] ^ 0x5C);
 int message_size = ArraySize(message);
 
 uchar inner_data[];
+
 ArrayResize(
 inner_data,
 GOLD_BOT_HMAC_BLOCK_SIZE + message_size
 );
 
-ArrayCopy(inner_data, inner_pad, 0, 0, GOLD_BOT_HMAC_BLOCK_SIZE);
+ArrayCopy(
+inner_data,
+inner_pad,
+0,
+0,
+GOLD_BOT_HMAC_BLOCK_SIZE
+);
 
 if(message_size > 0)
 {
@@ -167,12 +177,19 @@ if(!CalculateSha256(inner_data, inner_hash))
 return false;
 
 uchar outer_data[];
+
 ArrayResize(
 outer_data,
 GOLD_BOT_HMAC_BLOCK_SIZE + ArraySize(inner_hash)
 );
 
-ArrayCopy(outer_data, outer_pad, 0, 0, GOLD_BOT_HMAC_BLOCK_SIZE);
+ArrayCopy(
+outer_data,
+outer_pad,
+0,
+0,
+GOLD_BOT_HMAC_BLOCK_SIZE
+);
 
 ArrayCopy(
 outer_data,
@@ -186,7 +203,7 @@ return CalculateSha256(outer_data, signature);
 }
 
 //+------------------------------------------------------------------+
-//| Create a unique request token                                    |
+//| Create a request token                                           |
 //+------------------------------------------------------------------+
 string CreateRequestToken(const int requested_length)
 {
@@ -210,8 +227,11 @@ return "";
 
 string token = BytesToHex(hash, ArraySize(hash));
 
-if(requested_length <= 0 || requested_length > StringLen(token))
+if(requested_length <= 0 ||
+requested_length > StringLen(token))
+{
 return "";
+}
 
 return StringSubstr(token, 0, requested_length);
 }
@@ -235,7 +255,7 @@ StringSubstr(hex, 20, 12);
 }
 
 //+------------------------------------------------------------------+
-//| Convert a datetime to UTC ISO-8601                               |
+//| Convert UTC datetime to ISO-8601                                 |
 //+------------------------------------------------------------------+
 string ToUtcIso8601(const datetime value)
 {
@@ -356,12 +376,13 @@ payload =
 
 bool first = true;
 
-// CopyRates with a series array uses index 0 for the newest bar.
-// Iterate backwards to serialize candles chronologically.
+// Logical index zero is the newest candle.
+// Reverse iteration produces chronological JSON.
 for(int i = copied - 1; i >= 0; i--)
 {
 datetime utc_open_time =
-rates[i].time - InpBrokerUtcOffsetMinutes * 60;
+rates[i].time -
+InpBrokerUtcOffsetMinutes * 60;
 
   if(!first)
      payload += ",";
@@ -369,14 +390,22 @@ rates[i].time - InpBrokerUtcOffsetMinutes * 60;
   first = false;
 
   payload +=
-     "{\"open_time\":\"" + ToUtcIso8601(utc_open_time) +
-     "\",\"open\":" + DoubleToString(rates[i].open, g_symbol_digits) +
-     ",\"high\":" + DoubleToString(rates[i].high, g_symbol_digits) +
-     ",\"low\":" + DoubleToString(rates[i].low, g_symbol_digits) +
-     ",\"close\":" + DoubleToString(rates[i].close, g_symbol_digits) +
-     ",\"tick_volume\":" + IntegerToString((long)rates[i].tick_volume) +
-     ",\"real_volume\":" + IntegerToString((long)rates[i].real_volume) +
-     ",\"spread_points\":" + IntegerToString((long)rates[i].spread) +
+     "{\"open_time\":\"" +
+     ToUtcIso8601(utc_open_time) +
+     "\",\"open\":" +
+     DoubleToString(rates[i].open, g_symbol_digits) +
+     ",\"high\":" +
+     DoubleToString(rates[i].high, g_symbol_digits) +
+     ",\"low\":" +
+     DoubleToString(rates[i].low, g_symbol_digits) +
+     ",\"close\":" +
+     DoubleToString(rates[i].close, g_symbol_digits) +
+     ",\"tick_volume\":" +
+     IntegerToString((long)rates[i].tick_volume) +
+     ",\"real_volume\":" +
+     IntegerToString((long)rates[i].real_volume) +
+     ",\"spread_points\":" +
+     IntegerToString((long)rates[i].spread) +
      ",\"is_closed\":true}";
 
 }
@@ -468,8 +497,9 @@ return StringLen(signature_hex) == 64;
 //+------------------------------------------------------------------+
 void SendCandleBatch()
 {
-if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE)
-!= ACCOUNT_TRADE_MODE_DEMO)
+if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(
+ACCOUNT_TRADE_MODE
+) != ACCOUNT_TRADE_MODE_DEMO)
 {
 Print("GOLD BOT: DEMO account required. Sending stopped.");
 return;
@@ -517,6 +547,7 @@ return;
 }
 
 char request_body[];
+
 int body_size = ArraySize(raw_body);
 
 ArrayResize(request_body, body_size);
@@ -532,7 +563,7 @@ string headers =
 "X-Signature: " + signature + "\r\n";
 
 string url =
-InpBackendBaseUrl + GOLD_BOT_CANDLES_PATH;
+g_backend_url + GOLD_BOT_CANDLES_PATH;
 
 char response[];
 string response_headers;
@@ -592,7 +623,7 @@ return INIT_PARAMETERS_INCORRECT;
 
 if(StringFind(InpBackendBaseUrl, "?") >= 0)
 {
-Print("GOLD BOT: Backend URL must not contain query parameters.");
+Print("GOLD BOT: URL query parameters are not allowed.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
@@ -610,7 +641,7 @@ return INIT_PARAMETERS_INCORRECT;
 
 if(StringLen(InpDeviceSecret) < 32)
 {
-Print("GOLD BOT: A valid registered device secret is required.");
+Print("GOLD BOT: A registered device secret is required.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
@@ -626,15 +657,17 @@ Print("GOLD BOT: Unsupported timeframe.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
-if(InpHistoryBars < 2 || InpHistoryBars > GOLD_BOT_MAX_HISTORY)
+if(InpHistoryBars < 2 ||
+InpHistoryBars > GOLD_BOT_MAX_HISTORY)
 {
 Print("GOLD BOT: History bars must be between 2 and 2000.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
-if(InpSendIntervalSeconds < 15 || InpSendIntervalSeconds > 3600)
+if(InpSendIntervalSeconds < 15 ||
+InpSendIntervalSeconds > 3600)
 {
-Print("GOLD BOT: Send interval must be between 15 and 3600 seconds.");
+Print("GOLD BOT: Send interval must be between 15 and 3600.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
@@ -645,22 +678,28 @@ Print("GOLD BOT: Invalid broker UTC offset.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
-if(InpRequestTimeoutMs < 1000 || InpRequestTimeoutMs > 60000)
+if(InpRequestTimeoutMs < 1000 ||
+InpRequestTimeoutMs > 60000)
 {
 Print("GOLD BOT: Invalid HTTP timeout.");
 return INIT_PARAMETERS_INCORRECT;
 }
 
-if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE)
-!= ACCOUNT_TRADE_MODE_DEMO)
+if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(
+ACCOUNT_TRADE_MODE
+) != ACCOUNT_TRADE_MODE_DEMO)
 {
-Print("GOLD BOT: REAL and CONTEST accounts are not accepted.");
+Print("GOLD BOT: DEMO account required.");
 return INIT_FAILED;
 }
 
 long digits = 0;
 
-if(!SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS, digits))
+if(!SymbolInfoInteger(
+InpSymbol,
+SYMBOL_DIGITS,
+digits
+))
 {
 Print("GOLD BOT: Unable to read symbol digits.");
 return INIT_FAILED;
@@ -668,23 +707,31 @@ return INIT_FAILED;
 
 g_symbol_digits = (int)digits;
 
-MathSrand((int)GetTickCount());
-
-string base_url = InpBackendBaseUrl;
+g_backend_url = InpBackendBaseUrl;
 
 while(
-StringLen(base_url) > 0 &&
-StringSubstr(base_url, StringLen(base_url) - 1, 1) == "/"
+StringLen(g_backend_url) > 0 &&
+StringSubstr(
+g_backend_url,
+StringLen(g_backend_url) - 1,
+1
+) == "/"
 )
 {
-base_url = StringSubstr(
-base_url,
+g_backend_url = StringSubstr(
+g_backend_url,
 0,
-StringLen(base_url) - 1
+StringLen(g_backend_url) - 1
 );
 }
 
-InpBackendBaseUrl = base_url;
+if(StringLen(g_backend_url) <= 8)
+{
+Print("GOLD BOT: Invalid normalized backend URL.");
+return INIT_PARAMETERS_INCORRECT;
+}
+
+MathSrand((int)GetTickCount());
 
 if(!EventSetTimer(InpSendIntervalSeconds))
 {
@@ -698,13 +745,13 @@ GetLastError()
 }
 
 Print("GOLD BOT: DEMO-only candle connector initialized.");
-Print("GOLD BOT: No trading or order-placement functions are enabled.");
+Print("GOLD BOT: No order-placement functions are enabled.");
 
 return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Timer event                                                       |
+//| Timer event                                                      |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
@@ -712,19 +759,23 @@ SendCandleBatch();
 }
 
 //+------------------------------------------------------------------+
-//| Tick event                                                        |
+//| Tick event                                                       |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-// Data transmission is timer-based.
-// No trading operations are performed here.
+// Transmission is timer-based.
+// No trading operations are performed.
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                           |
+//| Expert deinitialization                                          |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
 EventKillTimer();
-Print("GOLD BOT: Connector stopped. Reason: ", reason);
+
+Print(
+"GOLD BOT: Connector stopped. Reason: ",
+reason
+);
 }
