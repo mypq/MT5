@@ -1,3 +1,4 @@
+
 import hashlib
 import hmac
 import re
@@ -11,10 +12,12 @@ class SecurityVerificationError(Exception):
 
 class NonceStore(Protocol):
     """
-    Implement this interface using an atomic persistent store.
+    Atomic persistent nonce storage interface.
 
-    Redis implementation should use SET key value NX EX ttl.
-    A process-local dictionary is not sufficient for production.
+    Production implementations must use an atomic operation,
+    such as Redis SET key value NX EX ttl.
+
+    Process-local dictionaries are not production-safe.
     """
 
     async def claim_nonce(
@@ -23,18 +26,14 @@ class NonceStore(Protocol):
         nonce: str,
         ttl_seconds: int,
     ) -> bool:
-        """
-        Atomically claim a nonce.
-
-        Return True only when the nonce did not exist and was stored.
-        Return False when the nonce has already been used.
-        """
+        """Return True only when the nonce is stored for the first time."""
         ...
 
 
 _TIMESTAMP_PATTERN = re.compile(r"^[0-9]{1,12}$")
 _NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _SIGNATURE_PATTERN = re.compile(r"^[a-fA-F0-9]{64}$")
+_METHOD_PATTERN = re.compile(r"^[A-Z]{3,16}$")
 
 
 def _validate_secret(secret: str | bytes) -> bytes:
@@ -55,56 +54,123 @@ def _validate_secret(secret: str | bytes) -> bytes:
     return secret_bytes
 
 
+def _validate_source_id(source_id: str) -> str:
+    if not isinstance(source_id, str):
+        raise SecurityVerificationError(
+            "Invalid source identifier"
+        )
+
+    normalized = source_id.strip()
+
+    if (
+        not normalized
+        or len(normalized) > 128
+        or "\n" in normalized
+        or "\r" in normalized
+    ):
+        raise SecurityVerificationError(
+            "Invalid source identifier"
+        )
+
+    return normalized
+
+
+def _validate_timestamp(timestamp: str) -> str:
+    if (
+        not isinstance(timestamp, str)
+        or not _TIMESTAMP_PATTERN.fullmatch(timestamp)
+        or str(int(timestamp)) != timestamp
+    ):
+        raise SecurityVerificationError(
+            "Invalid request timestamp"
+        )
+
+    return timestamp
+
+
+def _validate_nonce(nonce: str) -> str:
+    if (
+        not isinstance(nonce, str)
+        or not _NONCE_PATTERN.fullmatch(nonce)
+    ):
+        raise SecurityVerificationError(
+            "Invalid request nonce"
+        )
+
+    return nonce
+
+
+def _validate_method(method: str) -> str:
+    if (
+        not isinstance(method, str)
+        or not _METHOD_PATTERN.fullmatch(method)
+    ):
+        raise SecurityVerificationError(
+            "Invalid HTTP method"
+        )
+
+    return method
+
+
+def _validate_path(path: str) -> str:
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or len(path) > 512
+        or "\n" in path
+        or "\r" in path
+        or "?" in path
+        or "#" in path
+    ):
+        raise SecurityVerificationError(
+            "Invalid request path"
+        )
+
+    return path
+
+
 def calculate_request_signature(
     *,
     secret: str | bytes,
+    method: str,
+    path: str,
     source_id: str,
     timestamp: str,
     nonce: str,
     raw_body: bytes,
 ) -> str:
     """
-    Calculate HMAC-SHA256 for the exact HTTP request body.
+    Calculate HMAC-SHA256 for one exact HTTP request.
 
-    Canonical message:
-        timestamp + newline
-        source_id + newline
-        nonce + newline
-        raw HTTP body bytes
+    Signed fields:
+        HTTP method
+        URL path
+        timestamp
+        source identifier
+        nonce
+        exact raw HTTP body bytes
+
+    The caller must use the same method, path, and body
+    when generating and verifying the signature.
     """
     secret_bytes = _validate_secret(secret)
+    normalized_method = _validate_method(method)
+    normalized_path = _validate_path(path)
+    normalized_source_id = _validate_source_id(source_id)
+    normalized_timestamp = _validate_timestamp(timestamp)
+    normalized_nonce = _validate_nonce(nonce)
 
     if not isinstance(raw_body, bytes):
         raise SecurityVerificationError(
             "Request body must be raw bytes"
         )
 
-    if not isinstance(source_id, str):
-        raise SecurityVerificationError(
-            "Invalid source identifier"
-        )
-
-    normalized_source_id = source_id.strip()
-
-    if not normalized_source_id or len(normalized_source_id) > 128:
-        raise SecurityVerificationError(
-            "Invalid source identifier"
-        )
-
-    if not _TIMESTAMP_PATTERN.fullmatch(timestamp):
-        raise SecurityVerificationError(
-            "Invalid request timestamp"
-        )
-
-    if not _NONCE_PATTERN.fullmatch(nonce):
-        raise SecurityVerificationError(
-            "Invalid request nonce"
-        )
-
     canonical_header = (
-        f"{timestamp}\n"
+        f"{normalized_method}\n"
+        f"{normalized_path}\n"
+        f"{normalized_timestamp}\n"
         f"{normalized_source_id}\n"
-        f"{nonce}\n"
+        f"{normalized_nonce}\n"
     ).encode("utf-8")
 
     message = canonical_header + raw_body
@@ -119,6 +185,8 @@ def calculate_request_signature(
 async def verify_signed_request(
     *,
     raw_body: bytes,
+    method: str,
+    path: str,
     source_id: str,
     timestamp: str,
     nonce: str,
@@ -129,46 +197,18 @@ async def verify_signed_request(
     future_skew_seconds: int = 5,
 ) -> None:
     """
-    Verify request authenticity, freshness, and replay protection.
+    Verify authenticity, request freshness, and replay protection.
 
     The caller must resolve device_secret from a trusted device
     registry using source_id. Never accept a secret supplied
     inside the request body.
 
-    The nonce store must provide an atomic claim operation.
-    Failure to access the store rejects the request.
+    The nonce store must provide an atomic persistent claim.
+    Any nonce-store failure rejects the request.
     """
-    if not isinstance(source_id, str):
-        raise SecurityVerificationError(
-            "Invalid source identifier"
-        )
-
-    normalized_source_id = source_id.strip()
-
-    if not normalized_source_id or len(normalized_source_id) > 128:
-        raise SecurityVerificationError(
-            "Invalid source identifier"
-        )
-
-    if not isinstance(timestamp, str):
-        raise SecurityVerificationError(
-            "Invalid request timestamp"
-        )
-
-    if not _TIMESTAMP_PATTERN.fullmatch(timestamp):
-        raise SecurityVerificationError(
-            "Invalid request timestamp"
-        )
-
-    if str(int(timestamp)) != timestamp:
-        raise SecurityVerificationError(
-            "Timestamp must use canonical decimal format"
-        )
-
-    if not isinstance(nonce, str) or not _NONCE_PATTERN.fullmatch(nonce):
-        raise SecurityVerificationError(
-            "Invalid request nonce"
-        )
+    normalized_source_id = _validate_source_id(source_id)
+    normalized_timestamp = _validate_timestamp(timestamp)
+    normalized_nonce = _validate_nonce(nonce)
 
     if not isinstance(signature, str):
         raise SecurityVerificationError(
@@ -195,22 +235,15 @@ async def verify_signed_request(
             "Invalid future clock-skew configuration"
         )
 
-    try:
-        secret_bytes = _validate_secret(device_secret)
-
-        expected_signature = calculate_request_signature(
-            secret=secret_bytes,
-            source_id=normalized_source_id,
-            timestamp=timestamp,
-            nonce=nonce,
-            raw_body=raw_body,
-        )
-    except SecurityVerificationError:
-        raise
-    except Exception as exc:
-        raise SecurityVerificationError(
-            "Unable to calculate request signature"
-        ) from exc
+    expected_signature = calculate_request_signature(
+        secret=device_secret,
+        method=method,
+        path=path,
+        source_id=normalized_source_id,
+        timestamp=normalized_timestamp,
+        nonce=normalized_nonce,
+        raw_body=raw_body,
+    )
 
     if not hmac.compare_digest(
         expected_signature,
@@ -221,7 +254,7 @@ async def verify_signed_request(
         )
 
     current_time = int(time.time())
-    request_time = int(timestamp)
+    request_time = int(normalized_timestamp)
 
     if request_time > current_time + future_skew_seconds:
         raise SecurityVerificationError(
@@ -233,12 +266,12 @@ async def verify_signed_request(
             "Request timestamp has expired"
         )
 
-    nonce_ttl = max_age_seconds + future_skew_seconds
+    nonce_ttl = max_age_seconds + future_skew_seconds + 1
 
     try:
         claimed = await nonce_store.claim_nonce(
             source_id=normalized_source_id,
-            nonce=nonce,
+            nonce=normalized_nonce,
             ttl_seconds=nonce_ttl,
         )
     except Exception as exc:
@@ -249,4 +282,4 @@ async def verify_signed_request(
     if claimed is not True:
         raise SecurityVerificationError(
             "Request nonce has already been used"
-  )
+        )
