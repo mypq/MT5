@@ -27,6 +27,7 @@ from typing import Any
 MINIMUM_PAIRED_RETURNS = 30
 MAXIMUM_TIMESTAMP_GAP_SECONDS = 86400
 MAXIMUM_DATA_AGE_HOURS = 24
+MAX_FUTURE_MINUTES = 5
 
 STRONG_CORRELATION_THRESHOLD = 0.70
 MODERATE_CORRELATION_THRESHOLD = 0.40
@@ -651,4 +652,4 @@ def analyze_intermarket(
             "This module does not fetch live market data.",
             "This module does not generate or execute trading orders.",
         ],
-        }
+    }
