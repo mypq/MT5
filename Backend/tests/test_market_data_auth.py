@@ -56,7 +56,7 @@ def build_request(
     headers=None,
     query_string=b"",
 ):
-    request_body = body or b"{}"
+    request_body = b"{}" if body is None else body
     delivered = False
 
     async def receive():
@@ -81,8 +81,10 @@ def build_request(
 
     for key, value in (headers or {}).items():
         header_items.append(
-            (key.lower().encode("latin-1"),
-             value.encode("latin-1"))
+            (
+                key.lower().encode("latin-1"),
+                value.encode("latin-1"),
+            )
         )
 
     scope = {
