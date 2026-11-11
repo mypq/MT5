@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 
@@ -9,6 +10,7 @@ from app.core.config import settings
 from app.core.device_registry import DeviceRegistry
 from app.core.device_secret_crypto import DeviceSecretCipher
 from app.core.market_data_store import MarketDataStore
+from app.core.nonce_cleanup import run_nonce_cleanup
 from app.core.postgres_nonce_store import PostgresNonceStore
 
 
@@ -17,11 +19,14 @@ logger = logging.getLogger("gold_bot.backend")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cleanup_task: asyncio.Task | None = None
+
     app.state.shutting_down = False
     app.state.database_status = "NOT_CONNECTED"
     app.state.device_registry = None
     app.state.nonce_store = None
     app.state.market_data_store = None
+    app.state.nonce_cleanup_task = None
 
     logger.info("GOLD BOT backend starting")
 
@@ -47,8 +52,7 @@ async def lifespan(app: FastAPI):
 
             market_data_store = MarketDataStore(database_url)
 
-            # All security and persistence stores must initialize
-            # successfully before the API accepts market data.
+            # Initialize every required store before accepting data.
             await nonce_store.initialize()
             await device_registry.initialize()
             await market_data_store.initialize()
@@ -58,9 +62,18 @@ async def lifespan(app: FastAPI):
             app.state.market_data_store = market_data_store
             app.state.database_status = "CONNECTED"
 
+            # Start cleanup only after nonce storage is ready.
+            cleanup_task = asyncio.create_task(
+                run_nonce_cleanup(nonce_store),
+                name="gold-bot-nonce-cleanup",
+            )
+
+            app.state.nonce_cleanup_task = cleanup_task
+
             logger.info(
                 "Market-data security and storage initialized"
             )
+
         else:
             app.state.database_status = "DISABLED"
 
@@ -77,6 +90,19 @@ async def lifespan(app: FastAPI):
 
     finally:
         app.state.shutting_down = True
+
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                logger.info(
+                    "Nonce cleanup task stopped"
+                )
+
+            app.state.nonce_cleanup_task = None
+
         logger.info("GOLD BOT backend shutting down")
 
 
@@ -154,6 +180,17 @@ async def system_status():
         else database_status == "DISABLED"
     )
 
+    cleanup_task = getattr(
+        app.state,
+        "nonce_cleanup_task",
+        None,
+    )
+
+    cleanup_running = (
+        cleanup_task is not None
+        and not cleanup_task.done()
+    )
+
     return {
         "application": settings.APP_NAME,
         "version": settings.APP_VERSION,
@@ -182,6 +219,9 @@ async def system_status():
             "initialized"
             if app.state.market_data_store is not None
             else "disabled"
+        ),
+        "nonce_cleanup_status": (
+            "running" if cleanup_running else "stopped"
         ),
         "mt5_connection_status": "NOT_CONNECTED",
     }
