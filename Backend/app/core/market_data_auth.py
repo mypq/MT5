@@ -75,6 +75,36 @@ async def authenticate_market_data_request(
             "Content-Type must be application/json"
         )
 
+    content_length = request.headers.get("content-length")
+
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise MarketDataAuthenticationError(
+                "Invalid Content-Length header"
+            ) from exc
+
+        if (
+            declared_length < 0
+            or declared_length > MAX_REQUEST_BODY_BYTES
+        ):
+            raise MarketDataAuthenticationError(
+                "Request body exceeds the allowed size"
+            )
+
+    raw_body = await request.body()
+
+    if not raw_body:
+        raise MarketDataAuthenticationError(
+            "Request body cannot be empty"
+        )
+
+    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+        raise MarketDataAuthenticationError(
+            "Request body exceeds the allowed size"
+        )
+
     source_id = request.headers.get("X-Device-ID")
     timestamp = request.headers.get("X-Timestamp")
     nonce = request.headers.get("X-Nonce")
@@ -116,36 +146,6 @@ async def authenticate_market_data_request(
     if len(signature) != 64:
         raise MarketDataAuthenticationError(
             "Invalid request signature"
-        )
-
-    content_length = request.headers.get("content-length")
-
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError as exc:
-            raise MarketDataAuthenticationError(
-                "Invalid Content-Length header"
-            ) from exc
-
-        if (
-            declared_length < 0
-            or declared_length > MAX_REQUEST_BODY_BYTES
-        ):
-            raise MarketDataAuthenticationError(
-                "Request body exceeds the allowed size"
-            )
-
-    raw_body = await request.body()
-
-    if not raw_body:
-        raise MarketDataAuthenticationError(
-            "Request body cannot be empty"
-        )
-
-    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
-        raise MarketDataAuthenticationError(
-            "Request body exceeds the allowed size"
         )
 
     try:
