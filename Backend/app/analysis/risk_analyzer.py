@@ -6,7 +6,7 @@ Independent capital protection and trade risk validation.
 Features:
 - Risk-based position sizing
 - Direction-aware stop-loss validation
-- Reward-to-risk calculation
+- Net reward-to-risk calculation after estimated costs
 - Realized and floating daily loss protection
 - Account equity drawdown protection
 - Open position risk aggregation
@@ -295,6 +295,36 @@ def _validate_volume_rules(
         )
 
 
+def _calculate_execution_cost_per_lot(
+    instrument: Mapping[str, float],
+) -> float:
+    """
+    Return the estimated total execution cost per lot.
+
+    commission_per_lot must represent the expected total commission
+    for opening and closing one lot, not just one side.
+
+    slippage_ticks is a conservative allowance for adverse execution.
+    swap_allowance_per_lot is an estimated holding-period allowance.
+    """
+
+    cost = (
+        instrument["commission_per_lot"]
+        + instrument["swap_allowance_per_lot"]
+        + (
+            instrument["slippage_ticks"]
+            * instrument["tick_value_per_lot"]
+        )
+    )
+
+    if not isfinite(cost) or cost < 0:
+        raise RiskAnalysisError(
+            "Invalid execution cost allowance."
+        )
+
+    return cost
+
+
 def _calculate_position_loss_per_lot(
     entry_price: float,
     stop_loss: float,
@@ -308,13 +338,8 @@ def _calculate_position_loss_per_lot(
         stop_distance / instrument["tick_size"]
     ) * instrument["tick_value_per_lot"]
 
-    execution_cost = (
-        instrument["commission_per_lot"]
-        + instrument["swap_allowance_per_lot"]
-        + (
-            instrument["slippage_ticks"]
-            * instrument["tick_value_per_lot"]
-        )
+    execution_cost = _calculate_execution_cost_per_lot(
+        instrument
     )
 
     total_loss = price_loss + execution_cost
@@ -325,6 +350,40 @@ def _calculate_position_loss_per_lot(
         )
 
     return total_loss
+
+
+def _calculate_net_reward_per_lot(
+    entry_price: float,
+    take_profit: float,
+    instrument: Mapping[str, float],
+) -> dict[str, float]:
+    target_distance = abs(
+        take_profit - entry_price
+    )
+
+    gross_reward = (
+        target_distance / instrument["tick_size"]
+    ) * instrument["tick_value_per_lot"]
+
+    execution_cost = _calculate_execution_cost_per_lot(
+        instrument
+    )
+
+    net_reward = max(
+        0.0,
+        gross_reward - execution_cost,
+    )
+
+    if not isfinite(gross_reward) or not isfinite(net_reward):
+        raise RiskAnalysisError(
+            "Unable to calculate net reward."
+        )
+
+    return {
+        "gross_reward_per_lot": gross_reward,
+        "execution_cost_per_lot": execution_cost,
+        "net_reward_per_lot": net_reward,
+    }
 
 
 def _round_volume_down(
@@ -538,9 +597,6 @@ def analyze_trade_risk(
             )
 
     stop_distance = abs(entry - stop)
-    target_distance = abs(target - entry)
-
-    reward_to_risk = target_distance / stop_distance
 
     loss_per_lot = _calculate_position_loss_per_lot(
         entry,
@@ -548,9 +604,19 @@ def analyze_trade_risk(
         instrument_data,
     )
 
-    reward_per_lot = (
-        target_distance / instrument_data["tick_size"]
-    ) * instrument_data["tick_value_per_lot"]
+    reward_data = _calculate_net_reward_per_lot(
+        entry,
+        target,
+        instrument_data,
+    )
+
+    net_reward_per_lot = reward_data["net_reward_per_lot"]
+
+    reward_to_risk = (
+        net_reward_per_lot / loss_per_lot
+        if loss_per_lot > 0
+        else 0.0
+    )
 
     account_equity = account_data["equity"]
 
@@ -661,7 +727,7 @@ def analyze_trade_risk(
 
     if reward_to_risk < rules["minimum_reward_to_risk"]:
         rejection_reasons.append(
-            "REWARD_TO_RISK_BELOW_MINIMUM"
+            "NET_REWARD_TO_RISK_BELOW_MINIMUM"
         )
 
     if calculated_volume <= 0:
@@ -673,8 +739,18 @@ def analyze_trade_risk(
         calculated_volume * loss_per_lot
     )
 
-    estimated_reward = (
-        calculated_volume * reward_per_lot
+    estimated_gross_reward = (
+        calculated_volume
+        * reward_data["gross_reward_per_lot"]
+    )
+
+    estimated_execution_cost = (
+        calculated_volume
+        * reward_data["execution_cost_per_lot"]
+    )
+
+    estimated_net_reward = (
+        calculated_volume * net_reward_per_lot
     )
 
     approved = not rejection_reasons
@@ -697,8 +773,20 @@ def analyze_trade_risk(
             "loss_per_lot_including_allowances": loss_per_lot,
             "calculated_volume_lots": calculated_volume,
             "estimated_trade_risk": estimated_trade_risk,
-            "estimated_reward_before_costs": estimated_reward,
-            "reward_to_risk_before_costs": reward_to_risk,
+            "gross_reward_per_lot": (
+                reward_data["gross_reward_per_lot"]
+            ),
+            "execution_cost_per_lot": (
+                reward_data["execution_cost_per_lot"]
+            ),
+            "net_reward_per_lot": net_reward_per_lot,
+            "estimated_gross_reward": estimated_gross_reward,
+            "estimated_execution_cost": estimated_execution_cost,
+            "estimated_net_reward": estimated_net_reward,
+            "net_reward_to_risk": reward_to_risk,
+            "minimum_required_reward_to_risk": (
+                rules["minimum_reward_to_risk"]
+            ),
         },
         "account_protection": {
             "equity": account_equity,
@@ -732,6 +820,7 @@ def analyze_trade_risk(
             "swap_allowance_per_lot": (
                 instrument_data["swap_allowance_per_lot"]
             ),
+            "commission_is_expected_round_trip": True,
         },
         "limitations": [
             "This module never executes or modifies trading orders.",
@@ -740,6 +829,7 @@ def analyze_trade_risk(
             "Account loss figures must be measured from the correct daily baseline.",
             "Only XAUUSD open positions are accepted.",
             "Tick size and tick value must come from verified broker specifications.",
+            "Commission allowance must represent the expected round-trip commission.",
             "Cost allowances are estimates and may differ from actual execution costs.",
             "Gap risk can cause losses beyond the estimated stop-loss amount.",
             "Pending orders and margin requirements are not calculated here.",
