@@ -719,3 +719,111 @@ def test_v2_rejects_unsupported_extra_candle_fields():
         market_data.MarketDataBatchV2.model_validate(
             payload
         )
+@pytest.mark.asyncio
+async def test_account_snapshot_is_received_and_stored(monkeypatch):
+    patch_runtime_types(monkeypatch)
+
+    sent_at = datetime.now(timezone.utc)
+
+    payload = {
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "account_mode": "DEMO",
+        "account_currency": "USD",
+        "balance": 10000.0,
+        "equity": 9950.0,
+        "daily_start_equity": 10000.0,
+        "free_margin": 9000.0,
+        "used_margin": 1000.0,
+        "daily_realized_loss": 50.0,
+        "positions_count": 1,
+        "sent_at": sent_at.isoformat(),
+    }
+
+    raw_body = json.dumps(payload).encode("utf-8")
+    store = FakeMarketDataStore(result=True)
+
+    request = build_request(
+        market_data_store=store,
+    )
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    result = await market_data.ingest_account(request)
+
+    assert result["status"] == "stored"
+    assert result["message_type"] == "account"
+    assert result["source_id"] == TEST_SOURCE_ID
+    assert len(store.saved_messages) == 1
+
+    saved = store.saved_messages[0]
+
+    assert saved["message_type"] == "account"
+    assert saved["raw_body"] == raw_body
+    assert saved["payload"]["account_mode"] == "DEMO"
+    assert saved["payload"]["equity"] == 9950.0
+
+
+@pytest.mark.asyncio
+async def test_positions_snapshot_is_received_and_stored(monkeypatch):
+    patch_runtime_types(monkeypatch)
+
+    sent_at = datetime.now(timezone.utc)
+    opened_at = sent_at - timedelta(minutes=5)
+
+    payload = {
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "sent_at": sent_at.isoformat(),
+        "positions": [
+            {
+                "position_id": "123456",
+                "symbol": "XAUUSD",
+                "side": "BUY",
+                "volume": 0.01,
+                "entry_price": 2650.0,
+                "current_price": 2655.0,
+                "stop_loss": 2640.0,
+                "take_profit": 2670.0,
+                "floating_profit": 5.0,
+                "opened_at": opened_at.isoformat(),
+            }
+        ],
+    }
+
+    raw_body = json.dumps(payload).encode("utf-8")
+    store = FakeMarketDataStore(result=True)
+
+    request = build_request(
+        market_data_store=store,
+    )
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    result = await market_data.ingest_positions(request)
+
+    assert result["status"] == "stored"
+    assert result["message_type"] == "positions"
+    assert result["source_id"] == TEST_SOURCE_ID
+    assert len(store.saved_messages) == 1
+
+    saved = store.saved_messages[0]
+
+    assert saved["message_type"] == "positions"
+    assert saved["raw_body"] == raw_body
+    assert len(saved["payload"]["positions"]) == 1
+    assert saved["payload"]["positions"][0]["position_id"] == "123456"
