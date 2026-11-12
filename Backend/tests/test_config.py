@@ -25,7 +25,22 @@ def test_default_settings_are_demo_only():
     ["development", "production", "testing"],
 )
 def test_valid_app_environments_are_accepted(environment):
-    settings = make_settings(APP_ENV=environment)
+    overrides = {}
+
+    if environment == "production":
+        overrides.update(
+            JWT_SECRET="j" * 32,
+            BACKEND_API_KEY="b" * 32,
+            DATABASE_URL=(
+                "postgresql+psycopg://user:pass@localhost/db"
+            ),
+        )
+
+    settings = make_settings(
+        APP_ENV=environment,
+        **overrides,
+    )
+
     assert settings.APP_ENV == environment
 
 
