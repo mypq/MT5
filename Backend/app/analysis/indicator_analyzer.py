@@ -214,10 +214,16 @@ def _atr(
 def _stochastic(
     candles: Sequence[dict[str, float]],
     period: int = 14,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
+    """
+    Calculate Fast %K, Slow %K and Slow %D for Stochastic 14/3/3.
+
+    Slow %K is the 3-period SMA of Fast %K.
+    Slow %D is the 3-period SMA of Slow %K.
+    """
     _validate_period(period)
 
-    if len(candles) < period + 2:
+    if len(candles) < period + 4:
         raise IndicatorAnalysisError(
             "Insufficient Stochastic data."
         )
@@ -226,7 +232,7 @@ def _stochastic(
     lows = [candle["low"] for candle in candles]
     closes = [candle["close"] for candle in candles]
 
-    k_values = []
+    fast_k_values = []
 
     for index in range(period - 1, len(candles)):
         highest = max(
@@ -237,23 +243,42 @@ def _stochastic(
         )
 
         if highest == lowest:
-            k_values.append(50.0)
+            fast_k_values.append(50.0)
         else:
-            k_values.append(
+            fast_k_values.append(
                 100.0
                 * (closes[index] - lowest)
                 / (highest - lowest)
             )
 
-    if len(k_values) < 3:
+    if len(fast_k_values) < 5:
         raise IndicatorAnalysisError(
-            "Insufficient data for Stochastic signal."
+            "Insufficient data for Stochastic 14/3/3."
         )
 
-    current_k = k_values[-1]
-    current_d = sum(k_values[-3:]) / 3.0
+    slow_k_values = [
+        sum(fast_k_values[index - 2:index + 1]) / 3.0
+        for index in range(2, len(fast_k_values))
+    ]
 
-    return current_k, current_d
+    slow_d_values = [
+        sum(slow_k_values[index - 2:index + 1]) / 3.0
+        for index in range(2, len(slow_k_values))
+    ]
+
+    fast_k = fast_k_values[-1]
+    slow_k = slow_k_values[-1]
+    slow_d = slow_d_values[-1]
+
+    if not all(
+        isfinite(value)
+        for value in (fast_k, slow_k, slow_d)
+    ):
+        raise IndicatorAnalysisError(
+            "Stochastic calculation is not finite."
+        )
+
+    return fast_k, slow_k, slow_d
 
 
 def analyze_indicators(
@@ -302,7 +327,9 @@ def analyze_indicators(
     atr = _atr(data, 14)
 
     # Stochastic 14/3/3
-    stochastic_k, stochastic_d = _stochastic(data, 14)
+    stochastic_fast_k, stochastic_k, stochastic_d = (
+        _stochastic(data, 14)
+    )
 
     calculated_values = [
         rsi,
@@ -313,6 +340,7 @@ def analyze_indicators(
         middle,
         lower_band,
         atr,
+        stochastic_fast_k,
         stochastic_k,
         stochastic_d,
     ]
@@ -322,7 +350,6 @@ def analyze_indicators(
             "One or more indicator results are not finite."
         )
 
-    # Interpretations are observations, not independent trade signals.
     observations = []
 
     if rsi >= 70:
@@ -372,6 +399,7 @@ def analyze_indicators(
             "bollinger_middle": middle,
             "bollinger_lower": lower_band,
             "atr_14": atr,
+            "stochastic_fast_k": stochastic_fast_k,
             "stochastic_k": stochastic_k,
             "stochastic_d": stochastic_d,
         },
@@ -380,6 +408,7 @@ def analyze_indicators(
             "Indicator thresholds do not guarantee reversals.",
             "ATR measures volatility, not price direction.",
             "Indicators can lag price movements.",
+            "Stochastic values are calculated using Fast %K, Slow %K and Slow %D smoothing.",
             "This module does not generate trading orders.",
         ],
     }
