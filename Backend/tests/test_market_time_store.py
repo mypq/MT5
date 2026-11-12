@@ -107,6 +107,30 @@ def test_accepts_none_timezone_name(store):
     assert store._validate_timezone_name(None) is None
 
 
+def test_accepts_real_iana_timezone(store):
+    assert (
+        store._validate_timezone_name("Asia/Baghdad")
+        == "Asia/Baghdad"
+    )
+
+
+def test_rejects_unknown_iana_timezone(store):
+    with pytest.raises(
+        MarketTimeStoreError,
+        match="Unknown IANA timezone",
+    ):
+        store._validate_timezone_name(
+            "Mars/Olympus_Mons"
+        )
+
+
+def test_rejects_malformed_iana_timezone(store):
+    with pytest.raises(MarketTimeStoreError):
+        store._validate_timezone_name(
+            "Asia//Baghdad"
+        )
+
+
 @pytest.mark.parametrize(
     "offset",
     [
