@@ -440,6 +440,134 @@ async def test_sent_at_is_normalized_to_utc_before_storage(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_v2_batch_stores_each_raw_candle_in_original_sequence(
+    monkeypatch,
+):
+    message_id = uuid4()
+
+    candles = [
+        {
+            "broker_local_time": "2026-11-12T09:01:00",
+            "open": 2650.0,
+            "high": 2652.0,
+            "low": 2649.0,
+            "close": 2651.0,
+            "tick_volume": 100,
+            "real_volume": 0,
+            "spread_points": 20,
+            "is_closed": True,
+        },
+        {
+            "broker_local_time": "2026-11-12T09:00:00",
+            "open": 2651.0,
+            "high": 2653.0,
+            "low": 2650.0,
+            "close": 2652.0,
+            "tick_volume": 120,
+            "real_volume": 0,
+            "spread_points": 20,
+            "is_closed": True,
+        },
+    ]
+
+    payload = {
+        "schema_version": 2,
+        "source_id": TEST_SOURCE_ID,
+        "message_id": str(message_id),
+        "symbol": "XAUUSD",
+        "timeframe": "M1",
+        "broker_time": {
+            "server_name": "Demo Server",
+        },
+        "candles": candles,
+    }
+
+    message = build_message(
+        message_id=message_id,
+        raw_body=b'{"v2":"raw-candle-batch"}',
+        payload=payload,
+    )
+
+    connection = FakeConnection(insert_result=(77,))
+    store = create_store(monkeypatch, connection)
+
+    result = await store.store_message(**message)
+
+    assert result is True
+    assert len(connection.executed_statements) == 3
+
+    parent_query = connection.executed_statements[0][0]
+    first_raw_query, first_raw_parameters = (
+        connection.executed_statements[1]
+    )
+    second_raw_query, second_raw_parameters = (
+        connection.executed_statements[2]
+    )
+
+    assert "INSERT INTO gold_bot_market_data_messages" in parent_query
+    assert "INSERT INTO gold_bot_candles_raw" in first_raw_query
+    assert "INSERT INTO gold_bot_candles_raw" in second_raw_query
+
+    assert first_raw_parameters[0] == 77
+    assert first_raw_parameters[4] == datetime(
+        2026, 11, 12, 9, 1
+    )
+    assert first_raw_parameters[5] == 0
+    assert first_raw_parameters[6] == "Demo Server"
+
+    assert second_raw_parameters[0] == 77
+    assert second_raw_parameters[4] == datetime(
+        2026, 11, 12, 9, 0
+    )
+    assert second_raw_parameters[5] == 1
+    assert second_raw_parameters[6] == "Demo Server"
+
+
+@pytest.mark.asyncio
+async def test_v2_batch_rejects_invalid_local_time_before_database_write(
+    monkeypatch,
+):
+    message_id = uuid4()
+
+    payload = {
+        "schema_version": 2,
+        "source_id": TEST_SOURCE_ID,
+        "message_id": str(message_id),
+        "symbol": "XAUUSD",
+        "timeframe": "M1",
+        "candles": [
+            {
+                "broker_local_time": "2026-11-12T09:00",
+                "open": 2650.0,
+                "high": 2652.0,
+                "low": 2649.0,
+                "close": 2651.0,
+                "tick_volume": 100,
+                "real_volume": 0,
+                "spread_points": 20,
+                "is_closed": True,
+            },
+        ],
+    }
+
+    connection = FakeConnection(insert_result=(77,))
+    store = create_store(monkeypatch, connection)
+
+    message = build_message(
+        message_id=message_id,
+        payload=payload,
+    )
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Invalid raw candle broker-local time",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
 class FailingDatabaseConnection:
     def __enter__(self):
         return self
@@ -497,11 +625,38 @@ class FakeSchemaConnection:
         columns=None,
         constraints=None,
         indexes=None,
+        raw_columns=None,
+        raw_constraints=None,
+        raw_indexes=None,
+        trigger=None,
         fail_on=None,
     ):
         self.columns = columns
         self.constraints = constraints
         self.indexes = indexes
+        self.raw_columns = (
+            MarketDataStore._RAW_REQUIRED_COLUMNS
+            if raw_columns is None
+            else raw_columns
+        )
+        self.raw_constraints = (
+            [("uq_raw_candle_batch_sequence", "u")]
+            if raw_constraints is None
+            else raw_constraints
+        )
+        self.raw_indexes = (
+            [
+                ("idx_raw_candles_source_market_received", True, True),
+                ("idx_raw_candles_batch_sequence", True, True),
+            ]
+            if raw_indexes is None
+            else raw_indexes
+        )
+        self.trigger = (
+            [("trg_raw_candles_append_only", "O")]
+            if trigger is None
+            else trigger
+        )
         self.fail_on = fail_on
         self.executed_statements = []
 
@@ -524,20 +679,40 @@ class FakeSchemaConnection:
         if self.fail_on and self.fail_on in query:
             raise RuntimeError("simulated schema failure")
 
+        table_name = (
+            parameters[0]
+            if parameters
+            else None
+        )
+
         if "information_schema.columns" in query:
+            columns = (
+                self.raw_columns
+                if table_name == MarketDataStore._RAW_TABLE_NAME
+                else (self.columns or [])
+            )
             return FakeCursor(
-                [(column,) for column in (self.columns or [])]
+                [(column,) for column in columns]
             )
 
         if "FROM pg_constraint" in query:
-            return FakeCursor(
-                self.constraints or []
+            constraints = (
+                self.raw_constraints
+                if table_name == MarketDataStore._RAW_TABLE_NAME
+                else (self.constraints or [])
             )
+            return FakeCursor(constraints)
 
         if "FROM pg_index" in query:
-            return FakeCursor(
-                self.indexes or []
+            indexes = (
+                self.raw_indexes
+                if table_name == MarketDataStore._RAW_TABLE_NAME
+                else (self.indexes or [])
             )
+            return FakeCursor(indexes)
+
+        if "FROM pg_trigger" in query:
+            return FakeCursor(self.trigger)
 
         raise AssertionError(
             "Unexpected schema SQL statement"
@@ -579,7 +754,7 @@ async def test_initialize_accepts_complete_schema(monkeypatch):
 
     await store.initialize()
 
-    assert len(connection.executed_statements) == 3
+    assert len(connection.executed_statements) == 7
 
 
 @pytest.mark.asyncio
