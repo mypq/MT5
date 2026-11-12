@@ -295,3 +295,59 @@ async def test_postgres_rejects_unknown_device(store=None):
             utc_offset_minutes=120,
             evidence_reference="Unknown device test",
         )
+
+@pytest.mark.asyncio
+async def test_postgres_database_constraint_rejects_direct_overlap(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=60),
+                120,
+                "Direct database insert A",
+            ),
+        )
+
+        with pytest.raises(
+            psycopg.errors.ExclusionViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start + timedelta(days=30),
+                        start + timedelta(days=90),
+                        180,
+                        "Direct database insert B",
+                    ),
+                )
