@@ -237,3 +237,169 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
                 """,
                 (source_id,),
             )
+def _create_test_time_config(connection, source_id):
+    connection.execute(
+        """
+        INSERT INTO gold_bot_device_time_config (source_id)
+        VALUES (%s)
+        """,
+        (source_id,),
+    )
+
+
+def _insert_v2_period(
+    connection,
+    source_id,
+    start,
+    end,
+    status="VERIFIED",
+    offset=180,
+):
+    connection.execute(
+        """
+        INSERT INTO gold_bot_time_offset_history_v2 (
+            source_id,
+            effective_from_utc,
+            effective_to_utc,
+            utc_offset_minutes,
+            evidence_reference,
+            validation_status
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            source_id,
+            start,
+            end,
+            offset,
+            "Constraint enforcement test",
+            status,
+        ),
+    )
+
+
+def test_v2_rejects_offset_outside_allowed_range():
+    source_id = "CHECK-OFFSET-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 1, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        _create_test_time_config(connection, source_id)
+
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                _insert_v2_period(
+                    connection,
+                    source_id,
+                    start,
+                    start + timedelta(days=1),
+                    offset=900,
+                )
+
+
+def test_v2_rejects_end_before_start():
+    source_id = "CHECK-PERIOD-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 2, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        _create_test_time_config(connection, source_id)
+
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                _insert_v2_period(
+                    connection,
+                    source_id,
+                    start,
+                    start - timedelta(days=1),
+                )
+
+
+def test_v2_rejects_unknown_validation_status():
+    source_id = "CHECK-STATUS-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 1, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        _create_test_time_config(connection, source_id)
+
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                _insert_v2_period(
+                    connection,
+                    source_id,
+                    start,
+                    start + timedelta(days=1),
+                    status="INVALID",
+                )
+
+
+def test_v2_rejects_unknown_device_source():
+    source_id = "CHECK-FK-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 1, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            with connection.transaction():
+                _insert_v2_period(
+                    connection,
+                    source_id,
+                    start,
+                    start + timedelta(days=1),
+                )
+
+
+def test_v2_rejects_overlapping_accepted_periods():
+    source_id = "CHECK-OVERLAP-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 1, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        _create_test_time_config(connection, source_id)
+
+        _insert_v2_period(
+            connection,
+            source_id,
+            start,
+            start + timedelta(days=10),
+        )
+
+        with pytest.raises(psycopg.errors.ExclusionViolation):
+            with connection.transaction():
+                _insert_v2_period(
+                    connection,
+                    source_id,
+                    start + timedelta(days=5),
+                    start + timedelta(days=15),
+                )
+
+
+def test_v2_allows_overlapping_rejected_periods():
+    source_id = "CHECK-REJECTED-" + uuid.uuid4().hex
+    start = datetime(2041, 1, 1, tzinfo=timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        _create_test_time_config(connection, source_id)
+
+        _insert_v2_period(
+            connection,
+            source_id,
+            start,
+            start + timedelta(days=10),
+            status="REJECTED",
+        )
+
+        _insert_v2_period(
+            connection,
+            source_id,
+            start + timedelta(days=5),
+            start + timedelta(days=15),
+            status="REJECTED",
+        )
+
+        count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM gold_bot_time_offset_history_v2
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        ).fetchone()[0]
+
+        assert count == 2
