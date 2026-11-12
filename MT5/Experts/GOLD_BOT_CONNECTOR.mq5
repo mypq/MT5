@@ -1,5 +1,6 @@
+
 #property strict
-#property version   "1.02"
+#property version   "1.03"
 #property description "GOLD BOT - DEMO-only XAUUSD market data connector"
 
 input string InpBackendBaseUrl = "https://YOUR_BACKEND_DOMAIN";
@@ -9,10 +10,9 @@ input string InpSymbol = "XAUUSD";
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1;
 input int InpHistoryBars = 200;
 input int InpSendIntervalSeconds = 60;
-input int InpBrokerUtcOffsetMinutes = 0;
 input int InpRequestTimeoutMs = 10000;
 
-#define GOLD_BOT_CANDLES_PATH "/api/v1/market-data/candles"
+#define GOLD_BOT_CANDLES_PATH "/api/v1/market-data/candles/v2"
 #define GOLD_BOT_MAX_HISTORY 2000
 #define GOLD_BOT_HMAC_BLOCK_SIZE 64
 
@@ -254,6 +254,22 @@ string ToUtcIso8601(const datetime value)
 }
 
 //+------------------------------------------------------------------+
+//| Preserve broker-local wall-clock time without timezone claim    |
+//+------------------------------------------------------------------+
+string ToBrokerLocalIso8601(const datetime value)
+{
+   string result = TimeToString(
+      value,
+      TIME_DATE | TIME_SECONDS
+   );
+
+   StringReplace(result, ".", "-");
+   StringReplace(result, " ", "T");
+
+   return result;
+}
+
+//+------------------------------------------------------------------+
 //| Validate source identifier                                       |
 //+------------------------------------------------------------------+
 bool IsValidSourceId(const string source_id)
@@ -305,7 +321,7 @@ string GetTimeframeName(const ENUM_TIMEFRAMES timeframe)
 }
 
 //+------------------------------------------------------------------+
-//| Build candle JSON payload                                        |
+//| Build V2 candle JSON payload                                     |
 //+------------------------------------------------------------------+
 bool BuildCandlePayload(string &payload, string &message_id)
 {
@@ -343,9 +359,9 @@ bool BuildCandlePayload(string &payload, string &message_id)
 
    datetime sent_time = TimeGMT();
 
-   // Correctly escaped JSON string construction.
    payload =
-      "{\"message_id\":\"" + message_id +
+      "{\"schema_version\":2" +
+      ",\"message_id\":\"" + message_id +
       "\",\"source_id\":\"" + InpSourceId +
       "\",\"symbol\":\"XAUUSD\"" +
       ",\"timeframe\":\"" + timeframe_name +
@@ -355,12 +371,14 @@ bool BuildCandlePayload(string &payload, string &message_id)
 
    bool first = true;
 
-   // CopyRates with series indexing: reverse to chronological order.
+   // Send candles in chronological order.
    for(int i = copied - 1; i >= 0; i--)
    {
-      datetime utc_open_time =
-         rates[i].time -
-         InpBrokerUtcOffsetMinutes * 60;
+      string broker_local_time =
+         ToBrokerLocalIso8601(rates[i].time);
+
+      if(broker_local_time == "")
+         return false;
 
       if(!first)
          payload += ",";
@@ -368,8 +386,8 @@ bool BuildCandlePayload(string &payload, string &message_id)
       first = false;
 
       payload +=
-         "{\"open_time\":\"" +
-         ToUtcIso8601(utc_open_time) +
+         "{\"broker_local_time\":\"" +
+         broker_local_time +
          "\",\"open\":" +
          DoubleToString(rates[i].open, g_symbol_digits) +
          ",\"high\":" +
@@ -468,7 +486,7 @@ bool SignRequest(
 }
 
 //+------------------------------------------------------------------+
-//| Send authenticated candle batch                                 |
+//| Send authenticated V2 candle batch                              |
 //+------------------------------------------------------------------+
 void SendCandleBatch()
 {
@@ -566,7 +584,7 @@ void SendCandleBatch()
    if(status_code == 200)
    {
       Print(
-         "GOLD BOT: Candle batch accepted. Message ID: ",
+         "GOLD BOT: V2 candle batch accepted. Message ID: ",
          message_id
       );
 
@@ -574,7 +592,7 @@ void SendCandleBatch()
    }
 
    Print(
-      "GOLD BOT: Backend rejected candle batch. HTTP status: ",
+      "GOLD BOT: Backend rejected V2 candle batch. HTTP status: ",
       status_code,
       ". Response: ",
       CharArrayToString(response, 0, WHOLE_ARRAY, CP_UTF8)
@@ -642,13 +660,6 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   if(InpBrokerUtcOffsetMinutes < -720 ||
-      InpBrokerUtcOffsetMinutes > 840)
-   {
-      Print("GOLD BOT: Invalid broker UTC offset.");
-      return INIT_PARAMETERS_INCORRECT;
-   }
-
    if(InpRequestTimeoutMs < 1000 ||
       InpRequestTimeoutMs > 60000)
    {
@@ -713,7 +724,8 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   Print("GOLD BOT: DEMO-only candle connector initialized.");
+   Print("GOLD BOT: DEMO-only V2 connector initialized.");
+   Print("GOLD BOT: Broker-local candle times are sent without UTC conversion.");
    Print("GOLD BOT: No order-placement functions are enabled.");
 
    return INIT_SUCCEEDED;
