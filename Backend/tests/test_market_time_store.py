@@ -958,3 +958,303 @@ async def test_initialize_wraps_database_connection_failure(store):
             match="Unable to initialize broker-time storage",
         ):
             await store.initialize()
+
+def test_new_period_locks_device_row_before_checking_overlap(
+    store,
+    utc_start,
+):
+    connection, context = make_connection([
+        ("MT5-DEMO-01",),
+        None,
+        (51,),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        store._add_utc_offset_period_sync(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=180,
+            evidence_reference="Broker evidence",
+            is_dst=False,
+        )
+
+    first_query = connection.execute.call_args_list[0].args[0]
+
+    assert "FOR UPDATE" in first_query
+    assert "gold_bot_device_time_config" in first_query
+
+
+def test_overlap_check_ignores_rejected_periods(
+    store,
+    utc_start,
+):
+    connection, context = make_connection([
+        ("MT5-DEMO-01",),
+        None,
+        (52,),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        store._add_utc_offset_period_sync(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=180,
+            evidence_reference="Broker evidence",
+            is_dst=False,
+        )
+
+    overlap_query = connection.execute.call_args_list[1].args[0]
+
+    assert "validation_status <> 'REJECTED'" in overlap_query
+
+
+def test_overlap_prevents_new_period_insertion(
+    store,
+    utc_start,
+):
+    connection, context = make_connection([
+        ("MT5-DEMO-01",),
+        (1,),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="overlaps",
+        ):
+            store._add_utc_offset_period_sync(
+                source_id="MT5-DEMO-01",
+                effective_from_utc=utc_start,
+                effective_to_utc=None,
+                utc_offset_minutes=180,
+                evidence_reference="Broker evidence",
+                is_dst=False,
+            )
+
+    assert connection.execute.call_count == 2
+
+
+def test_database_failure_while_adding_period_is_wrapped(
+    store,
+    utc_start,
+):
+    with patch.object(
+        store,
+        "_connect",
+        side_effect=RuntimeError("Database unavailable"),
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Unable to record UTC broker offset history",
+        ):
+            store._add_utc_offset_period_sync(
+                source_id="MT5-DEMO-01",
+                effective_from_utc=utc_start,
+                effective_to_utc=None,
+                utc_offset_minutes=180,
+                evidence_reference="Broker evidence",
+                is_dst=False,
+            )
+
+def test_validate_text_trims_surrounding_whitespace(store):
+    assert store._validate_text(
+        "  Broker A  ",
+        "broker name",
+        128,
+    ) == "Broker A"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "x" * 129,
+        123,
+        True,
+    ],
+)
+def test_validate_text_rejects_invalid_values(store, value):
+    with pytest.raises(MarketTimeStoreError):
+        store._validate_text(
+            value,
+            "broker name",
+            128,
+        )
+
+
+def test_validate_text_accepts_none(store):
+    assert store._validate_text(
+        None,
+        "broker name",
+        128,
+    ) is None
+
+
+def test_validate_utc_datetime_normalizes_non_utc_offset(store):
+    source = datetime(
+        2026, 1, 1, 5, 30,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+
+    result = store._validate_utc_datetime(
+        source,
+        "effective_from_utc",
+    )
+
+    assert result == datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [-720, -300, 0, 180, 840],
+)
+@pytest.mark.asyncio
+async def test_accepts_boundary_history_offsets(
+    store,
+    utc_start,
+    offset,
+):
+    with patch.object(
+        store,
+        "_add_utc_offset_period_sync",
+        return_value=60,
+    ) as add_mock:
+        result = await store.add_utc_offset_period(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=offset,
+            evidence_reference="Broker evidence",
+        )
+
+    assert result == 60
+    assert add_mock.call_args.kwargs["utc_offset_minutes"] == offset
+
+
+@pytest.mark.asyncio
+async def test_add_period_normalizes_boundaries_to_utc(
+    store,
+):
+    start = datetime(
+        2026, 1, 1, 3, 0,
+        tzinfo=timezone(timedelta(hours=3)),
+    )
+    end = datetime(
+        2026, 6, 1, 3, 0,
+        tzinfo=timezone(timedelta(hours=3)),
+    )
+
+    with patch.object(
+        store,
+        "_add_utc_offset_period_sync",
+        return_value=61,
+    ) as add_mock:
+        await store.add_utc_offset_period(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=start,
+            effective_to_utc=end,
+            utc_offset_minutes=180,
+            evidence_reference="Broker evidence",
+        )
+
+    kwargs = add_mock.call_args.kwargs
+
+    assert kwargs["effective_from_utc"] == datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    assert kwargs["effective_to_utc"] == datetime(
+        2026, 6, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+
+@pytest.mark.asyncio
+async def test_save_device_config_trims_and_validates_metadata(
+    store,
+):
+    with patch.object(
+        store,
+        "_save_device_config_sync",
+    ) as save_mock:
+        await store.save_device_config(
+            source_id="MT5-DEMO-01",
+            broker_name="  Broker A  ",
+            server_name="  Demo Server  ",
+            timezone_name="Asia/Baghdad",
+            reported_utc_offset_minutes=180,
+        )
+
+    kwargs = save_mock.call_args.kwargs
+
+    assert kwargs["broker_name"] == "Broker A"
+    assert kwargs["server_name"] == "Demo Server"
+    assert kwargs["timezone_name"] == "Asia/Baghdad"
+    assert kwargs["reported_utc_offset_minutes"] == 180
+
+
+@pytest.mark.asyncio
+async def test_save_device_config_rejects_invalid_timezone(
+    store,
+):
+    with pytest.raises(MarketTimeStoreError):
+        await store.save_device_config(
+            source_id="MT5-DEMO-01",
+            timezone_name="Invalid/Unknown_Zone",
+        )
+
+
+def test_save_device_config_wraps_database_failure(store):
+    with patch.object(
+        store,
+        "_connect",
+        side_effect=RuntimeError("Database unavailable"),
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Unable to save broker-time configuration",
+        ):
+            store._save_device_config_sync(
+                source_id="MT5-DEMO-01",
+                broker_name="Broker A",
+                server_name="Demo Server",
+                timezone_name="Asia/Baghdad",
+                reported_utc_offset_minutes=180,
+            )
+
+
+@pytest.mark.asyncio
+async def test_add_period_preserves_dst_value(store, utc_start):
+    with patch.object(
+        store,
+        "_add_utc_offset_period_sync",
+        return_value=62,
+    ) as add_mock:
+        await store.add_utc_offset_period(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=180,
+            evidence_reference="Broker evidence",
+            is_dst=True,
+        )
+
+    assert add_mock.call_args.kwargs["is_dst"] is True
