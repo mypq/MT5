@@ -262,3 +262,459 @@ def test_short_device_secret_is_rejected():
             source_id=TEST_SOURCE_ID,
             secret="too-short",
         )
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "short",
+        b"x" * 31,
+        None,
+        123,
+    ],
+)
+def test_invalid_device_secret_is_rejected(secret):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=secret,
+            method=TEST_METHOD,
+            path=TEST_PATH,
+            source_id=TEST_SOURCE_ID,
+            timestamp="1800000000",
+            nonce=TEST_NONCE,
+            raw_body=TEST_BODY,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        "",
+        "   ",
+        "x" * 129,
+        "invalid\nsource",
+        "invalid\rsource",
+        None,
+        123,
+    ],
+)
+def test_invalid_source_id_is_rejected(source_id):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=TEST_METHOD,
+            path=TEST_PATH,
+            source_id=source_id,
+            timestamp="1800000000",
+            nonce=TEST_NONCE,
+            raw_body=TEST_BODY,
+        )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "",
+        "abc",
+        "-1",
+        "+123",
+        "01",
+        "1.5",
+        "1" * 13,
+        None,
+    ],
+)
+def test_invalid_timestamp_format_is_rejected(timestamp):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=TEST_METHOD,
+            path=TEST_PATH,
+            source_id=TEST_SOURCE_ID,
+            timestamp=timestamp,
+            nonce=TEST_NONCE,
+            raw_body=TEST_BODY,
+        )
+
+
+@pytest.mark.parametrize(
+    "nonce",
+    [
+        "",
+        "short",
+        "x" * 129,
+        "invalid nonce value",
+        "invalid\nnonce",
+        None,
+    ],
+)
+def test_invalid_nonce_is_rejected(nonce):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=TEST_METHOD,
+            path=TEST_PATH,
+            source_id=TEST_SOURCE_ID,
+            timestamp="1800000000",
+            nonce=nonce,
+            raw_body=TEST_BODY,
+        )
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "",
+        "po",
+        "POST ",
+        "post",
+        "POST\n",
+        "POST/GET",
+        None,
+    ],
+)
+def test_invalid_http_method_is_rejected(method):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=method,
+            path=TEST_PATH,
+            source_id=TEST_SOURCE_ID,
+            timestamp="1800000000",
+            nonce=TEST_NONCE,
+            raw_body=TEST_BODY,
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "api/v1/candles",
+        "/api/v1/candles?x=1",
+        "/api/v1/candles#section",
+        "/api/v1/\ncandles",
+        "/api/v1/\rcandles",
+        "/" + ("x" * 512),
+        None,
+    ],
+)
+def test_invalid_request_path_is_rejected(path):
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=TEST_METHOD,
+            path=path,
+            source_id=TEST_SOURCE_ID,
+            timestamp="1800000000",
+            nonce=TEST_NONCE,
+            raw_body=TEST_BODY,
+        )
+
+
+def test_non_bytes_request_body_is_rejected():
+    with pytest.raises(SecurityVerificationError):
+        calculate_request_signature(
+            secret=TEST_SECRET,
+            method=TEST_METHOD,
+            path=TEST_PATH,
+            source_id=TEST_SOURCE_ID,
+            timestamp="1800000000",
+            nonce=TEST_NONCE,
+            raw_body="not-bytes",
+        )
+
+
+@pytest.mark.asyncio
+async def test_uppercase_signature_is_accepted(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    request = signed_request(timestamp=str(current_time))
+    request["signature"] = request["signature"].upper()
+
+    await verify_signed_request(
+        **request,
+        nonce_store=MemoryNonceStore(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_id_surrounding_whitespace_is_normalized(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    request = signed_request(timestamp=str(current_time))
+    request["source_id"] = f" {TEST_SOURCE_ID} "
+
+    store = MemoryNonceStore()
+
+    await verify_signed_request(
+        **request,
+        nonce_store=store,
+    )
+
+    assert (TEST_SOURCE_ID, TEST_NONCE) in store.nonces
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "max_age_seconds",
+    [0, -1, 301, 1000],
+)
+async def test_invalid_max_age_configuration_is_rejected(
+    monkeypatch,
+    max_age_seconds,
+):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    request = signed_request(timestamp=str(current_time))
+
+    with pytest.raises(
+        SecurityVerificationError,
+        match="maximum request age",
+    ):
+        await verify_signed_request(
+            **request,
+            nonce_store=MemoryNonceStore(),
+            max_age_seconds=max_age_seconds,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "future_skew_seconds",
+    [-1, 31, 100],
+)
+async def test_invalid_future_skew_configuration_is_rejected(
+    monkeypatch,
+    future_skew_seconds,
+):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    request = signed_request(timestamp=str(current_time))
+
+    with pytest.raises(
+        SecurityVerificationError,
+        match="future clock-skew",
+    ):
+        await verify_signed_request(
+            **request,
+            nonce_store=MemoryNonceStore(),
+            future_skew_seconds=future_skew_seconds,
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonce_store_receives_expected_ttl(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    class RecordingNonceStore:
+        def __init__(self):
+            self.received = None
+
+        async def claim_nonce(
+            self,
+            source_id,
+            nonce,
+            ttl_seconds,
+        ):
+            self.received = (
+                source_id,
+                nonce,
+                ttl_seconds,
+            )
+            return True
+
+    store = RecordingNonceStore()
+    request = signed_request(timestamp=str(current_time))
+
+    await verify_signed_request(
+        **request,
+        nonce_store=store,
+        max_age_seconds=30,
+        future_skew_seconds=5,
+    )
+
+    assert store.received == (
+        TEST_SOURCE_ID,
+        TEST_NONCE,
+        36,
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonce_store_false_result_rejects_request(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    class RejectingNonceStore:
+        async def claim_nonce(
+            self,
+            source_id,
+            nonce,
+            ttl_seconds,
+        ):
+            return False
+
+    request = signed_request(timestamp=str(current_time))
+
+    with pytest.raises(
+        SecurityVerificationError,
+        match="already been used",
+    ):
+        await verify_signed_request(
+            **request,
+            nonce_store=RejectingNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonce_store_non_boolean_result_is_rejected(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    class InvalidNonceStore:
+        async def claim_nonce(
+            self,
+            source_id,
+            nonce,
+            ttl_seconds,
+        ):
+            return 1
+
+    request = signed_request(timestamp=str(current_time))
+
+    with pytest.raises(
+        SecurityVerificationError,
+        match="already been used",
+    ):
+        await verify_signed_request(
+            **request,
+            nonce_store=InvalidNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_signature_format_is_rejected(monkeypatch):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    request = signed_request(timestamp=str(current_time))
+    request["signature"] = "not-a-valid-signature"
+
+    with pytest.raises(
+        SecurityVerificationError,
+        match="signature format",
+    ):
+        await verify_signed_request(
+            **request,
+            nonce_store=MemoryNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonce_is_not_claimed_when_signature_is_invalid(
+    monkeypatch,
+):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    store = MemoryNonceStore()
+    request = signed_request(timestamp=str(current_time))
+    request["signature"] = "0" * 64
+
+    with pytest.raises(SecurityVerificationError):
+        await verify_signed_request(
+            **request,
+            nonce_store=store,
+        )
+
+    assert store.nonces == set()
+
+
+@pytest.mark.asyncio
+async def test_nonce_is_not_claimed_when_timestamp_is_expired(
+    monkeypatch,
+):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    store = MemoryNonceStore()
+    request = signed_request(
+        timestamp=str(current_time - 31)
+    )
+
+    with pytest.raises(SecurityVerificationError):
+        await verify_signed_request(
+            **request,
+            nonce_store=store,
+        )
+
+    assert store.nonces == set()
+
+
+@pytest.mark.asyncio
+async def test_nonce_is_not_claimed_when_timestamp_is_in_future(
+    monkeypatch,
+):
+    current_time = 1_800_000_000
+    monkeypatch.setattr(
+        market_data_security.time,
+        "time",
+        lambda: current_time,
+    )
+
+    store = MemoryNonceStore()
+    request = signed_request(
+        timestamp=str(current_time + 6)
+    )
+
+    with pytest.raises(SecurityVerificationError):
+        await verify_signed_request(
+            **request,
+            nonce_store=store,
+        )
+
+    assert store.nonces == set()
