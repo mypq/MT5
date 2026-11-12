@@ -1,4 +1,3 @@
-
 import asyncio
 import re
 from datetime import datetime, timezone
@@ -464,6 +463,11 @@ class MarketTimeStore:
             "proof source",
             256,
         )
+
+        if proof_source is None:
+            raise MarketTimeStoreError(
+                "Proof source is required"
+            )
 
         if not isinstance(is_dst, (bool, type(None))):
             raise MarketTimeStoreError(
