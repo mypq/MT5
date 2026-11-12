@@ -807,3 +807,154 @@ async def test_resolution_rejects_non_datetime_input(store):
             source_id="MT5-DEMO-01",
             broker_local_time="2026-01-01T03:00:00",
         )
+
+def make_initialize_connection(
+    *,
+    missing_table=None,
+    missing_column=None,
+    constraint_exists=True,
+):
+    required_columns = {
+        "gold_bot_device_time_config": [
+            "source_id",
+            "broker_name",
+            "server_name",
+            "timezone_name",
+            "time_source",
+            "reported_utc_offset_minutes",
+            "config_status",
+            "updated_at",
+        ],
+        "gold_bot_time_offset_history": [
+            "id",
+            "source_id",
+            "broker_local_from",
+            "broker_local_to",
+            "utc_offset_minutes",
+            "proof_source",
+            "is_dst",
+            "validation_status",
+            "recorded_at",
+        ],
+        "gold_bot_time_offset_history_v2": [
+            "id",
+            "source_id",
+            "effective_from_utc",
+            "effective_to_utc",
+            "utc_offset_minutes",
+            "evidence_reference",
+            "is_dst",
+            "validation_status",
+            "recorded_at",
+        ],
+    }
+
+    rows = []
+
+    for table_name, columns in required_columns.items():
+        if table_name == missing_table:
+            continue
+
+        for column_name in columns:
+            if (
+                table_name == missing_column[0]
+                and column_name == missing_column[1]
+            ) if missing_column else False:
+                continue
+
+            rows.append((table_name, column_name))
+
+    connection = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = rows
+    result.fetchone.return_value = (constraint_exists,)
+    connection.execute.return_value = result
+
+    context = MagicMock()
+    context.__enter__.return_value = connection
+    context.__exit__.return_value = False
+
+    return connection, context
+
+
+@pytest.mark.asyncio
+async def test_initialize_accepts_complete_database_schema(store):
+    _, context = make_initialize_connection()
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_database_table(store):
+    _, context = make_initialize_connection(
+        missing_table="gold_bot_time_offset_history_v2",
+    )
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Missing table",
+        ):
+            await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_database_column(store):
+    _, context = make_initialize_connection(
+        missing_column=(
+            "gold_bot_device_time_config",
+            "timezone_name",
+        ),
+    )
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="missing columns",
+        ):
+            await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_overlap_constraint(store):
+    _, context = make_initialize_connection(
+        constraint_exists=False,
+    )
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Missing V2 time overlap exclusion constraint",
+        ):
+            await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_wraps_database_connection_failure(store):
+    with patch.object(
+        store,
+        "_connect",
+        side_effect=RuntimeError("Database unavailable"),
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Unable to initialize broker-time storage",
+        ):
+            await store.initialize()
