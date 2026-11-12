@@ -539,3 +539,38 @@ def test_postgres_rejects_time_history_for_unknown_device(
                         "Unknown device history test",
                     ),
                 )
+def test_postgres_rejects_changing_history_to_unknown_device(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    record_id = asyncio.run(
+        store.add_utc_offset_period(
+            source_id=source_id,
+            effective_from_utc=start,
+            effective_to_utc=start + timedelta(days=30),
+            utc_offset_minutes=180,
+            evidence_reference="Source change protection test",
+        )
+    )
+
+    unknown_source_id = "PG-UNKNOWN-" + uuid.uuid4().hex
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(
+            psycopg.errors.ForeignKeyViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE gold_bot_time_offset_history_v2
+                    SET source_id = %s
+                    WHERE id = %s
+                    """,
+                    (unknown_source_id, record_id),
+                )
