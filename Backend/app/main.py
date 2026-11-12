@@ -14,6 +14,7 @@ from app.core.market_data_store import MarketDataStore
 from app.core.market_time_store import MarketTimeStore
 from app.core.nonce_cleanup import run_nonce_cleanup
 from app.core.postgres_nonce_store import PostgresNonceStore
+from app.core.windows_time_sync import inspect_windows_time_sync
 
 
 logger = logging.getLogger("gold_bot.backend")
@@ -57,7 +58,6 @@ async def lifespan(app: FastAPI):
 
             market_time_store = MarketTimeStore(database_url)
 
-            # Initialize every required store before accepting data.
             await nonce_store.initialize()
             await device_registry.initialize()
             await market_data_store.initialize()
@@ -198,6 +198,10 @@ async def system_status():
         and not cleanup_task.done()
     )
 
+    backend_clock_sync = await asyncio.to_thread(
+        inspect_windows_time_sync
+    )
+
     return {
         "application": settings.APP_NAME,
         "version": settings.APP_VERSION,
@@ -212,6 +216,7 @@ async def system_status():
             "running" if backend_healthy else "unhealthy"
         ),
         "database_status": database_status,
+        "backend_clock_sync": backend_clock_sync,
         "device_registry_status": (
             "initialized"
             if app.state.device_registry is not None
