@@ -365,3 +365,108 @@ class OpenPositionsSnapshot(StrictModel):
                 )
 
         return self
+class MarketCandleV2(StrictModel):
+    broker_local_time: datetime
+
+    open: float = Field(gt=0)
+    high: float = Field(gt=0)
+    low: float = Field(gt=0)
+    close: float = Field(gt=0)
+
+    tick_volume: int = Field(ge=0)
+    real_volume: int = Field(ge=0)
+    spread_points: int = Field(ge=0)
+
+    is_closed: Literal[True]
+
+    @field_validator("broker_local_time")
+    @classmethod
+    def validate_broker_local_time(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        if (
+            value.tzinfo is not None
+            and value.utcoffset() is not None
+        ):
+            raise ValueError(
+                "Broker-local time must not contain timezone data"
+            )
+
+        return value
+
+    @model_validator(mode="after")
+    def validate_ohlc(self):
+        if self.high < max(self.open, self.close):
+            raise ValueError(
+                "Candle high cannot be below open or close"
+            )
+
+        if self.low > min(self.open, self.close):
+            raise ValueError(
+                "Candle low cannot be above open or close"
+            )
+
+        if self.high < self.low:
+            raise ValueError(
+                "Candle high cannot be below candle low"
+            )
+
+        return self
+
+
+class MarketDataBatchV2(StrictModel):
+    schema_version: Literal[2] = 2
+
+    message_id: UUID
+
+    source_id: str = Field(
+        min_length=1,
+        max_length=128,
+    )
+
+    symbol: Literal["XAUUSD"] = "XAUUSD"
+    timeframe: MarketTimeframe
+    sent_at: datetime
+
+    volume_source: VolumeSource = VolumeSource.UNKNOWN
+
+    candles: list[MarketCandleV2] = Field(
+        min_length=2,
+        max_length=2000,
+    )
+
+    @field_validator("sent_at")
+    @classmethod
+    def validate_sent_at(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        return reject_future_datetime(value, "sent_at")
+
+    @field_validator("source_id")
+    @classmethod
+    def validate_source_id(
+        cls,
+        value: str,
+    ) -> str:
+        return validate_source_identifier(value)
+
+    @model_validator(mode="after")
+    def validate_candle_sequence(self):
+        timestamps = [
+            candle.broker_local_time
+            for candle in self.candles
+        ]
+
+        if timestamps != sorted(timestamps):
+            raise ValueError(
+                "Candles must be ordered chronologically"
+            )
+
+        if len(timestamps) != len(set(timestamps)):
+            raise ValueError(
+                "Duplicate broker-local candle timestamps are not allowed"
+            )
+
+        return self
