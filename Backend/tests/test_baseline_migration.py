@@ -208,7 +208,10 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
                 ),
             )
 
-        command.downgrade(config, "base")
+        # Do not downgrade to base.
+        # Baseline and raw-candle migrations are intentionally non-destructive.
+        # Downgrading only the Alembic revision would leave existing tables
+        # in place and cause duplicate-table errors during the next upgrade.
         command.upgrade(config, "head")
 
         with psycopg.connect(DATABASE_URL) as connection:
@@ -292,7 +295,7 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
         )
 
         assert revision is not None
-        assert revision[0] == "0001_baseline"
+        assert revision[0] == "0002_candles_raw"
 
     finally:
         with psycopg.connect(DATABASE_URL) as connection:
