@@ -1575,3 +1575,64 @@ async def test_postgres_config_update_rolls_back_if_history_update_fails(
                 DROP FUNCTION IF EXISTS {function_name}()
                 """
             )
+@pytest.mark.asyncio
+async def test_postgres_initialize_preserves_legacy_time_history(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    local_start = datetime(2020, 10, 25, 1, 0, 0)
+    local_end = datetime(2020, 10, 25, 2, 0, 0)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        record_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history (
+                source_id,
+                broker_local_from,
+                broker_local_to,
+                utc_offset_minutes,
+                proof_source,
+                is_dst,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                source_id,
+                local_start,
+                local_end,
+                180,
+                "Legacy preservation test",
+                True,
+                "UNVERIFIED",
+            ),
+        ).fetchone()[0]
+
+    await store.initialize()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                broker_local_from,
+                broker_local_to,
+                utc_offset_minutes,
+                proof_source,
+                is_dst,
+                validation_status
+            FROM gold_bot_time_offset_history
+            WHERE id = %s
+            """,
+            (record_id,),
+        ).fetchone()
+
+    assert row == (
+        local_start,
+        local_end,
+        180,
+        "Legacy preservation test",
+        True,
+        "UNVERIFIED",
+    )
