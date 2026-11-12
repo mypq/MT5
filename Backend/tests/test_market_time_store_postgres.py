@@ -503,3 +503,39 @@ def test_postgres_prevents_deleting_device_with_time_history(
                     """,
                     (source_id,),
                 )
+def test_postgres_rejects_time_history_for_unknown_device(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    unknown_source_id = "PG-UNKNOWN-" + uuid.uuid4().hex
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(
+            psycopg.errors.ForeignKeyViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        unknown_source_id,
+                        start,
+                        start + timedelta(days=30),
+                        180,
+                        "Unknown device history test",
+                    ),
+                )
