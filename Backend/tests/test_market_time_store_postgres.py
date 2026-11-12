@@ -574,3 +574,334 @@ def test_postgres_rejects_changing_history_to_unknown_device(
                     """,
                     (unknown_source_id, record_id),
                 )
+
+def test_postgres_rejects_update_that_creates_overlap(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    first_id = asyncio.run(
+        store.add_utc_offset_period(
+            source_id=source_id,
+            effective_from_utc=start,
+            effective_to_utc=start + timedelta(days=30),
+            utc_offset_minutes=120,
+            evidence_reference="First protected period",
+        )
+    )
+
+    second_id = asyncio.run(
+        store.add_utc_offset_period(
+            source_id=source_id,
+            effective_from_utc=start + timedelta(days=30),
+            effective_to_utc=start + timedelta(days=60),
+            utc_offset_minutes=180,
+            evidence_reference="Second protected period",
+        )
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(
+            psycopg.errors.ExclusionViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE gold_bot_time_offset_history_v2
+                    SET effective_from_utc = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        start + timedelta(days=15),
+                        second_id,
+                    ),
+                )
+
+    assert first_id != second_id
+
+
+def test_postgres_rejects_open_ended_period_overlap(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, NULL, %s, %s)
+            """,
+            (
+                source_id,
+                start,
+                180,
+                "Open ended period",
+            ),
+        )
+
+        with pytest.raises(
+            psycopg.errors.ExclusionViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start + timedelta(days=30),
+                        start + timedelta(days=60),
+                        120,
+                        "Overlapping closed period",
+                    ),
+                )
+
+
+def test_postgres_rejects_reactivating_overlapping_period(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'UNVERIFIED')
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=60),
+                120,
+                "Active period",
+            ),
+        )
+
+        rejected = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'REJECTED')
+            RETURNING id
+            """,
+            (
+                source_id,
+                start + timedelta(days=30),
+                start + timedelta(days=90),
+                180,
+                "Rejected overlapping period",
+            ),
+        ).fetchone()
+
+        rejected_id = rejected[0]
+
+        with pytest.raises(
+            psycopg.errors.ExclusionViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE gold_bot_time_offset_history_v2
+                    SET validation_status = 'UNVERIFIED'
+                    WHERE id = %s
+                    """,
+                    (rejected_id,),
+                )
+
+
+def test_postgres_rejects_invalid_validation_status(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(
+            psycopg.errors.CheckViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference,
+                        validation_status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start,
+                        start + timedelta(days=30),
+                        120,
+                        "Invalid status test",
+                        "UNKNOWN",
+                    ),
+                )
+
+
+def test_postgres_accepts_minimum_and_maximum_utc_offsets(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                -720,
+                "Minimum valid UTC offset",
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                source_id,
+                start + timedelta(days=30),
+                start + timedelta(days=60),
+                840,
+                "Maximum valid UTC offset",
+            ),
+        )
+
+
+def test_postgres_allows_same_period_for_different_devices(
+    postgres_store,
+):
+    store, first_source_id = postgres_store
+
+    second_source_id = "PG-TEST-" + uuid.uuid4().hex
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    try:
+        asyncio.run(
+            store.save_device_config(
+                source_id=second_source_id,
+                broker_name="Second Test Broker",
+                server_name="Second Test Server",
+                timezone_name="Asia/Baghdad",
+                reported_utc_offset_minutes=180,
+            )
+        )
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            for source_id in (
+                first_source_id,
+                second_source_id,
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start,
+                        start + timedelta(days=30),
+                        180,
+                        "Independent device period",
+                    ),
+                )
+
+    finally:
+        with psycopg.connect(DATABASE_URL) as connection:
+            connection.execute(
+                """
+                DELETE FROM gold_bot_time_offset_history_v2
+                WHERE source_id = %s
+                """,
+                (second_source_id,),
+            )
+
+            connection.execute(
+                """
+                DELETE FROM gold_bot_device_time_config
+                WHERE source_id = %s
+                """,
+                (second_source_id,),
+            )
