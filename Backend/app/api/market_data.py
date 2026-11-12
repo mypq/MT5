@@ -1,4 +1,3 @@
-
 from typing import Type
 from uuid import UUID
 
@@ -15,6 +14,7 @@ from app.core.market_data_store import (
     MarketDataStore,
     MarketDataStoreError,
 )
+from app.core.market_time_store import MarketTimeStore
 from app.core.postgres_nonce_store import PostgresNonceStore
 from app.schemas.market_data import (
     AccountSnapshot,
