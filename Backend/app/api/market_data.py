@@ -1,3 +1,4 @@
+
 from typing import Type
 from uuid import UUID
 
@@ -14,10 +15,15 @@ from app.core.market_data_store import (
     MarketDataStore,
     MarketDataStoreError,
 )
+from app.core.market_time_store import (
+    MarketTimeStore,
+    MarketTimeStoreError,
+)
 from app.core.postgres_nonce_store import PostgresNonceStore
 from app.schemas.market_data import (
     AccountSnapshot,
     MarketDataBatch,
+    MarketDataBatchV2,
     OpenPositionsSnapshot,
 )
 
@@ -33,6 +39,7 @@ async def _ingest_message(
     request: Request,
     message_type: str,
     model_type: Type[BaseModel],
+    resolve_broker_time: bool = False,
 ) -> dict:
     device_registry = getattr(
         request.app.state,
@@ -52,13 +59,27 @@ async def _ingest_message(
         None,
     )
 
-    if not all(
+    market_time_store = getattr(
+        request.app.state,
+        "market_time_store",
+        None,
+    )
+
+    dependencies_available = all(
         (
             isinstance(device_registry, DeviceRegistry),
             isinstance(nonce_store, PostgresNonceStore),
             isinstance(market_data_store, MarketDataStore),
         )
-    ):
+    )
+
+    if resolve_broker_time:
+        dependencies_available = (
+            dependencies_available
+            and isinstance(market_time_store, MarketTimeStore)
+        )
+
+    if not dependencies_available:
         raise HTTPException(
             status_code=503,
             detail="Market-data ingestion is unavailable",
@@ -101,6 +122,47 @@ async def _ingest_message(
     sent_at = message.sent_at
     payload = message.model_dump(mode="json")
 
+    if resolve_broker_time:
+        unresolved_candles = []
+
+        try:
+            for index, candle in enumerate(message.candles):
+                resolved_time = (
+                    await market_time_store.resolve_broker_local_time(
+                        source_id=source_id,
+                        broker_local_time=candle.broker_local_time,
+                    )
+                )
+
+                if resolved_time is None:
+                    unresolved_candles.append(index)
+                    continue
+
+                payload["candles"][index][
+                    "open_time_utc"
+                ] = resolved_time.isoformat()
+
+        except MarketTimeStoreError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Broker-time resolution is unavailable",
+            ) from exc
+
+        if unresolved_candles:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "BROKER_TIME_UNVERIFIED",
+                    "message": (
+                        "One or more candle timestamps cannot be "
+                        "resolved using verified broker-time history"
+                    ),
+                    "unresolved_candle_indices": unresolved_candles,
+                },
+            )
+
+        payload["time_resolution_status"] = "VERIFIED"
+
     try:
         inserted = await market_data_store.store_message(
             message_type=message_type,
@@ -135,6 +197,16 @@ async def ingest_candles(request: Request):
         request=request,
         message_type="candles",
         model_type=MarketDataBatch,
+    )
+
+
+@router.post("/candles/v2")
+async def ingest_candles_v2(request: Request):
+    return await _ingest_message(
+        request=request,
+        message_type="candles",
+        model_type=MarketDataBatchV2,
+        resolve_broker_time=True,
     )
 
 
