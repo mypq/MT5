@@ -176,7 +176,7 @@ class MarketTimeStore:
                 )
 
                 # Preserve the legacy table exactly.
-                # Its historical local-time records are never
+                # Historical local-time records are never
                 # automatically reinterpreted.
                 connection.execute(
                     """
@@ -453,7 +453,7 @@ class MarketTimeStore:
                           OR effective_to_utc > %s
                       )
                       AND (
-                          %s IS NULL
+                          %s::TIMESTAMPTZ IS NULL
                           OR effective_from_utc < %s
                       )
                     LIMIT 1
