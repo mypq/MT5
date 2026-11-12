@@ -905,3 +905,179 @@ def test_postgres_allows_same_period_for_different_devices(
                 """,
                 (second_source_id,),
             )
+
+def test_postgres_config_change_invalidates_verified_history(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        verified_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'VERIFIED')
+            RETURNING id
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                180,
+                "Verified history",
+            ),
+        ).fetchone()[0]
+
+        rejected_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'REJECTED')
+            RETURNING id
+            """,
+            (
+                source_id,
+                start + timedelta(days=30),
+                start + timedelta(days=60),
+                180,
+                "Rejected history",
+            ),
+        ).fetchone()[0]
+
+        connection.execute(
+            """
+            UPDATE gold_bot_device_time_config
+            SET config_status = 'VERIFIED'
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        )
+
+    asyncio.run(
+        store.save_device_config(
+            source_id=source_id,
+            broker_name="Integration Test Broker",
+            server_name="PostgreSQL Test Server",
+            timezone_name="Asia/Baghdad",
+            reported_utc_offset_minutes=180,
+        )
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, validation_status
+            FROM gold_bot_time_offset_history_v2
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (verified_id, rejected_id),
+        ).fetchall()
+
+        config_status = connection.execute(
+            """
+            SELECT config_status
+            FROM gold_bot_device_time_config
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        ).fetchone()[0]
+
+    assert rows == [
+        (verified_id, "UNVERIFIED"),
+        (rejected_id, "REJECTED"),
+    ]
+
+    assert config_status == "UNVERIFIED"
+
+
+def test_postgres_unchanged_config_preserves_verified_history(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        record_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'VERIFIED')
+            RETURNING id
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                180,
+                "Unchanged config test",
+            ),
+        ).fetchone()[0]
+
+        connection.execute(
+            """
+            UPDATE gold_bot_device_time_config
+            SET config_status = 'VERIFIED'
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        )
+
+    asyncio.run(
+        store.save_device_config(
+            source_id=source_id,
+            broker_name="Integration Test Broker",
+            server_name="PostgreSQL Test Server",
+            timezone_name="Europe/Athens",
+            reported_utc_offset_minutes=120,
+        )
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        row = connection.execute(
+            """
+            SELECT validation_status
+            FROM gold_bot_time_offset_history_v2
+            WHERE id = %s
+            """,
+            (record_id,),
+        ).fetchone()
+
+        config_status = connection.execute(
+            """
+            SELECT config_status
+            FROM gold_bot_device_time_config
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        ).fetchone()[0]
+
+    assert row[0] == "VERIFIED"
+    assert config_status == "VERIFIED"
