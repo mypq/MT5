@@ -1,3 +1,4 @@
+
 import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -14,6 +15,7 @@ from app.core.market_data_store import (
     MarketDataMessageConflictError,
     MarketDataStoreError,
 )
+from app.core.market_time_store import MarketTimeStoreError
 
 
 TEST_SOURCE_ID = "MT5-DEMO-01"
@@ -42,11 +44,35 @@ class FakeMarketDataStore:
         return self.result
 
 
+class FakeMarketTimeStore:
+    def __init__(self, results=None, error=None):
+        self.results = list(results or [])
+        self.error = error
+        self.calls = []
+
+    async def resolve_broker_local_time(
+        self,
+        *,
+        source_id,
+        broker_local_time,
+    ):
+        self.calls.append((source_id, broker_local_time))
+
+        if self.error is not None:
+            raise self.error
+
+        if not self.results:
+            return None
+
+        return self.results.pop(0)
+
+
 def build_request(
     *,
     device_registry=None,
     nonce_store=None,
     market_data_store=None,
+    market_time_store=None,
 ):
     app = FastAPI()
 
@@ -58,6 +84,9 @@ def build_request(
     )
     app.state.market_data_store = (
         market_data_store or FakeMarketDataStore()
+    )
+    app.state.market_time_store = (
+        market_time_store or FakeMarketTimeStore()
     )
 
     scope = {
@@ -129,6 +158,44 @@ def build_valid_candles_payload():
     }
 
 
+def build_valid_candles_v2_payload():
+    now = datetime.now(timezone.utc)
+
+    return {
+        "schema_version": 2,
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "symbol": "XAUUSD",
+        "timeframe": "M1",
+        "sent_at": now.isoformat(),
+        "volume_source": "TICK",
+        "candles": [
+            {
+                "broker_local_time": "2026-11-12T09:00:00",
+                "open": 2650.0,
+                "high": 2652.0,
+                "low": 2649.0,
+                "close": 2651.0,
+                "tick_volume": 100,
+                "real_volume": 0,
+                "spread_points": 20,
+                "is_closed": True,
+            },
+            {
+                "broker_local_time": "2026-11-12T09:01:00",
+                "open": 2651.0,
+                "high": 2653.0,
+                "low": 2650.0,
+                "close": 2652.0,
+                "tick_volume": 120,
+                "real_volume": 0,
+                "spread_points": 20,
+                "is_closed": True,
+            },
+        ],
+    }
+
+
 def patch_runtime_types(monkeypatch):
     monkeypatch.setattr(
         market_data,
@@ -144,6 +211,11 @@ def patch_runtime_types(monkeypatch):
         market_data,
         "MarketDataStore",
         FakeMarketDataStore,
+    )
+    monkeypatch.setattr(
+        market_data,
+        "MarketTimeStore",
+        FakeMarketTimeStore,
     )
 
 
@@ -402,4 +474,169 @@ async def test_storage_failure_returns_503(
     assert (
         error.value.detail
         == "Market-data storage is unavailable"
-  )
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_verified_candles_are_stored_with_utc_times(
+    monkeypatch,
+):
+    patch_runtime_types(monkeypatch)
+
+    payload = build_valid_candles_v2_payload()
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    first_utc = datetime(
+        2026, 11, 12, 7, 0, tzinfo=timezone.utc
+    )
+    second_utc = datetime(
+        2026, 11, 12, 7, 1, tzinfo=timezone.utc
+    )
+
+    time_store = FakeMarketTimeStore(
+        results=[first_utc, second_utc]
+    )
+    data_store = FakeMarketDataStore()
+
+    request = build_request(
+        market_data_store=data_store,
+        market_time_store=time_store,
+    )
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    result = await market_data.ingest_candles_v2(request)
+
+    assert result["status"] == "stored"
+    assert result["message_type"] == "candles"
+    assert len(data_store.saved_messages) == 1
+
+    saved = data_store.saved_messages[0]
+    saved_payload = saved["payload"]
+
+    assert saved["raw_body"] == raw_body
+    assert saved_payload["time_resolution_status"] == "VERIFIED"
+
+    assert (
+        saved_payload["candles"][0]["open_time_utc"]
+        == first_utc.isoformat()
+    )
+
+    assert (
+        saved_payload["candles"][1]["open_time_utc"]
+        == second_utc.isoformat()
+    )
+
+    assert len(time_store.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_v2_unverified_candle_rejects_entire_batch(
+    monkeypatch,
+):
+    patch_runtime_types(monkeypatch)
+
+    payload = build_valid_candles_v2_payload()
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    time_store = FakeMarketTimeStore(
+        results=[
+            datetime(
+                2026, 11, 12, 7, 0, tzinfo=timezone.utc
+            ),
+            None,
+        ]
+    )
+
+    data_store = FakeMarketDataStore()
+
+    request = build_request(
+        market_data_store=data_store,
+        market_time_store=time_store,
+    )
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await market_data.ingest_candles_v2(request)
+
+    assert error.value.status_code == 422
+    assert (
+        error.value.detail["error"]
+        == "BROKER_TIME_UNVERIFIED"
+    )
+    assert error.value.detail["unresolved_candle_indices"] == [1]
+    assert data_store.saved_messages == []
+
+
+@pytest.mark.asyncio
+async def test_v2_missing_time_store_returns_503(
+    monkeypatch,
+):
+    patch_runtime_types(monkeypatch)
+
+    request = build_request(
+        market_time_store=object(),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await market_data.ingest_candles_v2(request)
+
+    assert error.value.status_code == 503
+    assert error.value.detail == (
+        "Market-data ingestion is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_time_resolution_failure_returns_503(
+    monkeypatch,
+):
+    patch_runtime_types(monkeypatch)
+
+    payload = build_valid_candles_v2_payload()
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    time_store = FakeMarketTimeStore(
+        error=MarketTimeStoreError("Database failure")
+    )
+
+    data_store = FakeMarketDataStore()
+
+    request = build_request(
+        market_data_store=data_store,
+        market_time_store=time_store,
+    )
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await market_data.ingest_candles_v2(request)
+
+    assert error.value.status_code == 503
+    assert (
+        error.value.detail
+        == "Broker-time resolution is unavailable"
+    )
+    assert data_store.saved_messages == []
