@@ -1,11 +1,10 @@
-
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.market_data_v2 import (
+from app.schemas.market_data import (
     MarketCandleV2,
     MarketDataBatchV2,
 )
@@ -13,7 +12,7 @@ from app.schemas.market_data_v2 import (
 
 def valid_candle(broker_time: str) -> dict:
     return {
-        "broker_open_time": broker_time,
+        "broker_local_time": broker_time,
         "open": 2650.0,
         "high": 2660.0,
         "low": 2640.0,
@@ -55,7 +54,7 @@ def test_valid_v2_batch_is_accepted():
     assert batch.symbol == "XAUUSD"
     assert batch.source_id == "MT5-DEMO-01"
     assert len(batch.candles) == 2
-    assert batch.candles[0].broker_open_time.tzinfo is None
+    assert batch.candles[0].broker_local_time.tzinfo is None
 
 
 @pytest.mark.parametrize(
@@ -71,7 +70,7 @@ def test_valid_v2_batch_is_accepted():
 )
 def test_v2_rejects_noncanonical_broker_time(invalid_time):
     payload = valid_batch()
-    payload["candles"][0]["broker_open_time"] = invalid_time
+    payload["candles"][0]["broker_local_time"] = invalid_time
 
     with pytest.raises(ValidationError):
         MarketDataBatchV2.model_validate(payload)
@@ -79,7 +78,7 @@ def test_v2_rejects_noncanonical_broker_time(invalid_time):
 
 def test_v2_rejects_invalid_calendar_date():
     payload = valid_batch()
-    payload["candles"][0]["broker_open_time"] = (
+    payload["candles"][0]["broker_local_time"] = (
         "2026-02-30T08:00:00"
     )
 
@@ -89,8 +88,8 @@ def test_v2_rejects_invalid_calendar_date():
 
 def test_v2_rejects_duplicate_broker_times():
     payload = valid_batch()
-    payload["candles"][1]["broker_open_time"] = (
-        payload["candles"][0]["broker_open_time"]
+    payload["candles"][1]["broker_local_time"] = (
+        payload["candles"][0]["broker_local_time"]
     )
 
     with pytest.raises(
@@ -132,9 +131,7 @@ def test_v2_rejects_unclosed_candle():
 
 def test_v2_rejects_invalid_timezone_name():
     payload = valid_batch()
-    payload["broker_time"]["timezone_name"] = (
-        "../invalid"
-    )
+    payload["broker_time"]["timezone_name"] = "../invalid"
 
     with pytest.raises(ValidationError):
         MarketDataBatchV2.model_validate(payload)
@@ -142,9 +139,7 @@ def test_v2_rejects_invalid_timezone_name():
 
 def test_v2_rejects_out_of_range_reported_offset():
     payload = valid_batch()
-    payload["broker_time"]["reported_utc_offset_minutes"] = (
-        900
-    )
+    payload["broker_time"]["reported_utc_offset_minutes"] = 900
 
     with pytest.raises(ValidationError):
         MarketDataBatchV2.model_validate(payload)
@@ -159,7 +154,7 @@ def test_v2_does_not_compare_broker_time_with_utc_sent_at():
 
     batch = MarketDataBatchV2.model_validate(payload)
 
-    assert batch.candles[-1].broker_open_time.year == 2099
+    assert batch.candles[-1].broker_local_time.year == 2099
 
 
 def test_v2_rejects_unknown_fields():
@@ -180,8 +175,8 @@ def test_v2_rejects_invalid_source_id():
 
 def test_v2_rejects_future_sent_at():
     payload = valid_batch()
-    payload["sent_at"] = (
-        datetime.now(timezone.utc).replace(year=2099)
+    payload["sent_at"] = datetime.now(timezone.utc).replace(
+        year=2099
     )
 
     with pytest.raises(ValidationError):
