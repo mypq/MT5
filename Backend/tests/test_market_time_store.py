@@ -635,3 +635,175 @@ async def test_resolution_database_failure_raises_store_error(
                 source_id="MT5-DEMO-01",
                 broker_local_time=datetime(2026, 1, 1, 3, 0),
             )
+
+@pytest.mark.asyncio
+async def test_rejects_invalid_source_id_for_new_period(
+    store,
+    utc_start,
+):
+    with pytest.raises(MarketTimeStoreError):
+        await store.add_utc_offset_period(
+            source_id="invalid source",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=180,
+            evidence_reference="Broker records",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejects_oversized_evidence_reference(
+    store,
+    utc_start,
+):
+    with pytest.raises(MarketTimeStoreError):
+        await store.add_utc_offset_period(
+            source_id="MT5-DEMO-01",
+            effective_from_utc=utc_start,
+            effective_to_utc=None,
+            utc_offset_minutes=180,
+            evidence_reference="E" * 513,
+        )
+
+
+@pytest.mark.asyncio
+async def test_verified_period_includes_exact_start_boundary(
+    store,
+):
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2026, 1, 2, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    _, context = make_fetchall_connection([
+        (start, end, 180),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+    assert result == start
+
+
+@pytest.mark.asyncio
+async def test_verified_period_excludes_exact_end_boundary(
+    store,
+):
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2026, 1, 2, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    _, context = make_fetchall_connection([
+        (start, end, 180),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 2, 3, 0),
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolution_query_only_uses_verified_records(
+    store,
+):
+    _, context = make_fetchall_connection([])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+    query = context.__enter__.return_value.execute.call_args.args[0]
+
+    assert "validation_status = 'VERIFIED'" in query
+
+
+def test_changed_device_config_invalidates_verified_periods(
+    store,
+):
+    connection, context = make_connection([
+        ("MT5-DEMO-01",),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        store._save_device_config_sync(
+            source_id="MT5-DEMO-01",
+            broker_name="Broker A",
+            server_name="Demo Server",
+            timezone_name="Asia/Baghdad",
+            reported_utc_offset_minutes=180,
+        )
+
+    assert connection.execute.call_count == 2
+
+    invalidation_query = (
+        connection.execute.call_args_list[1].args[0]
+    )
+
+    assert "validation_status = 'UNVERIFIED'" in invalidation_query
+    assert "validation_status = 'VERIFIED'" in invalidation_query
+
+
+def test_unchanged_device_config_does_not_invalidate_periods(
+    store,
+):
+    connection, context = make_connection([
+        None,
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        store._save_device_config_sync(
+            source_id="MT5-DEMO-01",
+            broker_name="Broker A",
+            server_name="Demo Server",
+            timezone_name="Asia/Baghdad",
+            reported_utc_offset_minutes=180,
+        )
+
+    assert connection.execute.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolution_rejects_non_datetime_input(store):
+    with pytest.raises(MarketTimeStoreError):
+        await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time="2026-01-01T03:00:00",
+        )
