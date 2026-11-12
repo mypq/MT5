@@ -1,6 +1,9 @@
-
+import asyncio
 from datetime import datetime, timedelta, timezone
+import os
+from importlib.resources import files
 from unittest.mock import MagicMock, patch
+from zoneinfo import TZPATH, ZoneInfo
 
 import pytest
 
@@ -442,3 +445,28 @@ def test_store_does_not_expose_legacy_period_writer(store):
 
 def test_utc_period_writer_is_available(store):
     assert callable(store.add_utc_offset_period)
+
+
+def test_uses_installed_tzdata_database():
+    if os.environ.get("PYTHONTZPATH") != "":
+        pytest.skip(
+            "This test requires PYTHONTZPATH to be empty"
+        )
+
+    assert TZPATH == ()
+
+    baghdad_zone_file = (
+        files("tzdata.zoneinfo")
+        .joinpath("Asia", "Baghdad")
+    )
+
+    assert baghdad_zone_file.is_file()
+
+    baghdad = ZoneInfo("Asia/Baghdad")
+
+    winter_time = datetime(
+        2026, 1, 15, 12, 0,
+        tzinfo=baghdad,
+    )
+
+    assert winter_time.utcoffset() == timedelta(hours=3)
