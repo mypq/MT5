@@ -1636,3 +1636,371 @@ async def test_postgres_initialize_preserves_legacy_time_history(
         True,
         "UNVERIFIED",
     )
+@pytest.mark.asyncio
+async def test_postgres_initialize_preserves_verified_v2_history(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2035, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2035, 7, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    record_id = await store.add_utc_offset_period(
+        source_id=source_id,
+        effective_from_utc=start,
+        effective_to_utc=end,
+        utc_offset_minutes=180,
+        evidence_reference="Verified initialization preservation",
+        is_dst=True,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            UPDATE gold_bot_time_offset_history_v2
+            SET validation_status = 'VERIFIED'
+            WHERE id = %s
+            """,
+            (record_id,),
+        )
+
+    await store.initialize()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                is_dst,
+                validation_status
+            FROM gold_bot_time_offset_history_v2
+            WHERE id = %s
+            """,
+            (record_id,),
+        ).fetchone()
+
+    assert row == (
+        start,
+        end,
+        180,
+        "Verified initialization preservation",
+        True,
+        "VERIFIED",
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialize_preserves_rejected_v2_history(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    start = datetime(
+        2036, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        record_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'REJECTED')
+            RETURNING id
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                180,
+                "Rejected initialization preservation",
+            ),
+        ).fetchone()[0]
+
+    await store.initialize()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        status = connection.execute(
+            """
+            SELECT validation_status
+            FROM gold_bot_time_offset_history_v2
+            WHERE id = %s
+            """,
+            (record_id,),
+        ).fetchone()[0]
+
+    assert status == "REJECTED"
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialize_preserves_verified_device_config(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            UPDATE gold_bot_device_time_config
+            SET config_status = 'VERIFIED'
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        )
+
+    await store.initialize()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                broker_name,
+                server_name,
+                timezone_name,
+                reported_utc_offset_minutes,
+                config_status
+            FROM gold_bot_device_time_config
+            WHERE source_id = %s
+            """,
+            (source_id,),
+        ).fetchone()
+
+    assert row == (
+        "Integration Test Broker",
+        "PostgreSQL Test Server",
+        "Europe/Athens",
+        120,
+        "VERIFIED",
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_initialize_does_not_duplicate_exclusion_constraint(
+    postgres_store,
+):
+    store, source_id = postgres_store
+
+    await store.initialize()
+    await store.initialize()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM pg_constraint
+            WHERE conname = 'ex_time_offset_v2_no_overlap'
+              AND conrelid =
+                  'gold_bot_time_offset_history_v2'::regclass
+            """
+        ).fetchone()[0]
+
+    assert count == 1
+    assert source_id.startswith("PG-TEST-")
+
+
+def test_postgres_legacy_history_prevents_device_deletion(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(2037, 1, 1, 0, 0, 0)
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history (
+                source_id,
+                broker_local_from,
+                broker_local_to,
+                utc_offset_minutes,
+                proof_source,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                180,
+                "Legacy foreign key protection",
+                "UNVERIFIED",
+            ),
+        )
+
+        with pytest.raises(
+            psycopg.errors.ForeignKeyViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    DELETE FROM gold_bot_device_time_config
+                    WHERE source_id = %s
+                    """,
+                    (source_id,),
+                )
+
+
+def test_postgres_legacy_history_rejects_invalid_database_values(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(2038, 1, 1, 0, 0, 0)
+
+    invalid_rows = [
+        (
+            start,
+            start,
+            180,
+            "Invalid legacy period",
+            "UNVERIFIED",
+        ),
+        (
+            start,
+            start + timedelta(days=30),
+            900,
+            "Invalid legacy offset",
+            "UNVERIFIED",
+        ),
+        (
+            start,
+            start + timedelta(days=30),
+            180,
+            "Invalid legacy status",
+            "UNKNOWN",
+        ),
+    ]
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        for local_start, local_end, offset, proof, status in invalid_rows:
+            with pytest.raises(
+                psycopg.errors.CheckViolation
+            ):
+                with connection.transaction():
+                    connection.execute(
+                        """
+                        INSERT INTO gold_bot_time_offset_history (
+                            source_id,
+                            broker_local_from,
+                            broker_local_to,
+                            utc_offset_minutes,
+                            proof_source,
+                            validation_status
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            source_id,
+                            local_start,
+                            local_end,
+                            offset,
+                            proof,
+                            status,
+                        ),
+                    )
+
+
+def test_postgres_device_config_rejects_invalid_database_values(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    with psycopg.connect(DATABASE_URL) as connection:
+
+        with pytest.raises(
+            psycopg.errors.CheckViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE gold_bot_device_time_config
+                    SET reported_utc_offset_minutes = 900
+                    WHERE source_id = %s
+                    """,
+                    (source_id,),
+                )
+
+        with pytest.raises(
+            psycopg.errors.CheckViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE gold_bot_device_time_config
+                    SET config_status = 'UNKNOWN'
+                    WHERE source_id = %s
+                    """,
+                    (source_id,),
+                )
+
+
+def test_postgres_database_allows_adjacent_v2_periods(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    boundary = datetime(
+        2039, 6, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        first_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                source_id,
+                boundary - timedelta(days=30),
+                boundary,
+                120,
+                "Direct adjacent period A",
+            ),
+        ).fetchone()[0]
+
+        second_id = connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                source_id,
+                boundary,
+                boundary + timedelta(days=30),
+                180,
+                "Direct adjacent period B",
+            ),
+        ).fetchone()[0]
+
+    assert first_id != second_id
