@@ -404,3 +404,60 @@ def test_postgres_allows_overlap_with_rejected_period(
                 "Replacement period",
             ),
         )
+def test_postgres_database_rejects_invalid_period_and_offset(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+
+        # Reject a period whose end equals its start.
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start,
+                        start,
+                        120,
+                        "Invalid zero-length period",
+                    ),
+                )
+
+        # Reject an offset outside the allowed range.
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    INSERT INTO gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes,
+                        evidence_reference
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        source_id,
+                        start,
+                        start + timedelta(days=30),
+                        900,
+                        "Invalid UTC offset",
+                    ),
+                )
