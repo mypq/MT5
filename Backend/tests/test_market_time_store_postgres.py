@@ -351,3 +351,56 @@ async def test_postgres_database_constraint_rejects_direct_overlap(
                         "Direct database insert B",
                     ),
                 )
+
+def test_postgres_allows_overlap_with_rejected_period(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'REJECTED')
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=60),
+                120,
+                "Rejected historical period",
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference,
+                validation_status
+            )
+            VALUES (%s, %s, %s, %s, %s, 'UNVERIFIED')
+            """,
+            (
+                source_id,
+                start + timedelta(days=30),
+                start + timedelta(days=90),
+                180,
+                "Replacement period",
+            ),
+        )
