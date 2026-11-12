@@ -1,3 +1,4 @@
+
 import asyncio
 import re
 from datetime import datetime, timezone
@@ -11,10 +12,13 @@ class MarketTimeStoreError(Exception):
 
 class MarketTimeStore:
     """
-    Stores per-device broker-time metadata and offset history.
+    Stores per-device broker-time metadata and UTC offset history.
 
-    Reported offsets remain unverified. This module does not convert
-    broker-local candle timestamps into UTC.
+    Legacy local-time history is preserved without reinterpretation.
+    New offset periods use UTC boundaries.
+
+    All newly recorded periods remain UNVERIFIED.
+    This module does not convert candle timestamps into UTC.
     """
 
     _SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -24,7 +28,9 @@ class MarketTimeStore:
 
     def __init__(self, database_url: str) -> None:
         if not isinstance(database_url, str):
-            raise MarketTimeStoreError("Database URL must be a string")
+            raise MarketTimeStoreError(
+                "Database URL must be a string"
+            )
 
         url = database_url.strip()
 
@@ -107,7 +113,7 @@ class MarketTimeStore:
         return value
 
     @staticmethod
-    def _validate_local_datetime(
+    def _validate_utc_datetime(
         value: datetime,
         field_name: str,
     ) -> datetime:
@@ -116,16 +122,24 @@ class MarketTimeStore:
                 f"{field_name} must be a datetime"
             )
 
-        if value.tzinfo is not None and value.utcoffset() is not None:
+        try:
+            offset = value.utcoffset()
+        except Exception as exc:
             raise MarketTimeStoreError(
-                f"{field_name} must be timezone-naive broker time"
+                f"{field_name} has invalid timezone information"
+            ) from exc
+
+        if value.tzinfo is None or offset is None:
+            raise MarketTimeStoreError(
+                f"{field_name} must be timezone-aware"
             )
 
-        return value.replace(tzinfo=None)
+        return value.astimezone(timezone.utc)
 
     def _initialize_sync(self) -> None:
         try:
             with self._connect() as connection:
+
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS
@@ -161,6 +175,9 @@ class MarketTimeStore:
                     """
                 )
 
+                # Preserve the legacy table exactly.
+                # Its historical local-time records are never
+                # automatically reinterpreted.
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS
@@ -223,13 +240,79 @@ class MarketTimeStore:
                     """
                 )
 
+                # New UTC-based history table.
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS
+                    gold_bot_time_offset_history_v2 (
+                        id BIGINT GENERATED ALWAYS AS IDENTITY
+                            PRIMARY KEY,
+
+                        source_id VARCHAR(128) NOT NULL
+                            REFERENCES gold_bot_device_time_config(
+                                source_id
+                            ) ON DELETE RESTRICT,
+
+                        effective_from_utc TIMESTAMPTZ NOT NULL,
+                        effective_to_utc TIMESTAMPTZ,
+
+                        utc_offset_minutes SMALLINT NOT NULL,
+
+                        evidence_reference VARCHAR(512) NOT NULL,
+
+                        is_dst BOOLEAN,
+
+                        validation_status VARCHAR(16) NOT NULL
+                            DEFAULT 'UNVERIFIED',
+
+                        recorded_at TIMESTAMPTZ NOT NULL
+                            DEFAULT CURRENT_TIMESTAMP,
+
+                        CONSTRAINT ck_time_offset_v2_range
+                            CHECK (
+                                utc_offset_minutes
+                                BETWEEN -720 AND 840
+                            ),
+
+                        CONSTRAINT ck_time_offset_v2_period
+                            CHECK (
+                                effective_to_utc IS NULL
+                                OR effective_to_utc > effective_from_utc
+                            ),
+
+                        CONSTRAINT ck_time_offset_v2_status
+                            CHECK (
+                                validation_status IN (
+                                    'UNVERIFIED',
+                                    'VERIFIED',
+                                    'REJECTED'
+                                )
+                            )
+                    )
+                    """
+                )
+
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_time_offset_history_v2_source_period
+                    ON gold_bot_time_offset_history_v2 (
+                        source_id,
+                        effective_from_utc
+                    )
+                    """
+                )
+
         except Exception as exc:
             raise MarketTimeStoreError(
                 "Unable to initialize broker-time storage"
             ) from exc
 
     async def initialize(self) -> None:
-        """Create tables without modifying existing market-data records."""
+        """
+        Create storage tables without modifying existing
+        market-data records or legacy offset records.
+        """
         await asyncio.to_thread(self._initialize_sync)
 
     def _save_device_config_sync(
@@ -254,8 +337,11 @@ class MarketTimeStore:
                         config_status,
                         updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, 'UNVERIFIED',
-                            CURRENT_TIMESTAMP)
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        'UNVERIFIED',
+                        CURRENT_TIMESTAMP
+                    )
 
                     ON CONFLICT (source_id)
                     DO UPDATE SET
@@ -328,18 +414,19 @@ class MarketTimeStore:
             reported_utc_offset_minutes=reported_utc_offset_minutes,
         )
 
-    def _add_offset_period_sync(
+    def _add_utc_offset_period_sync(
         self,
         *,
         source_id: str,
-        broker_local_from: datetime,
-        broker_local_to: datetime | None,
+        effective_from_utc: datetime,
+        effective_to_utc: datetime | None,
         utc_offset_minutes: int,
-        proof_source: str,
+        evidence_reference: str,
         is_dst: bool | None,
     ) -> int:
         try:
             with self._connect() as connection:
+
                 device = connection.execute(
                     """
                     SELECT source_id
@@ -358,52 +445,55 @@ class MarketTimeStore:
                 overlap = connection.execute(
                     """
                     SELECT 1
-                    FROM gold_bot_time_offset_history
+                    FROM gold_bot_time_offset_history_v2
                     WHERE source_id = %s
                       AND validation_status <> 'REJECTED'
                       AND (
-                          broker_local_to IS NULL
-                          OR broker_local_to > %s
+                          effective_to_utc IS NULL
+                          OR effective_to_utc > %s
                       )
                       AND (
                           %s IS NULL
-                          OR broker_local_from < %s
+                          OR effective_from_utc < %s
                       )
                     LIMIT 1
                     """,
                     (
                         source_id,
-                        broker_local_from,
-                        broker_local_to,
-                        broker_local_to,
+                        effective_from_utc,
+                        effective_to_utc,
+                        effective_to_utc,
                     ),
                 ).fetchone()
 
                 if overlap is not None:
                     raise MarketTimeStoreError(
-                        "Offset period overlaps an existing period"
+                        "UTC offset period overlaps an existing period"
                     )
 
                 row = connection.execute(
                     """
-                    INSERT INTO gold_bot_time_offset_history (
+                    INSERT INTO gold_bot_time_offset_history_v2 (
                         source_id,
-                        broker_local_from,
-                        broker_local_to,
+                        effective_from_utc,
+                        effective_to_utc,
                         utc_offset_minutes,
-                        proof_source,
+                        evidence_reference,
                         is_dst,
                         validation_status
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, 'UNVERIFIED')
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        'UNVERIFIED'
+                    )
                     RETURNING id
                     """,
                     (
                         source_id,
-                        broker_local_from,
-                        broker_local_to,
+                        effective_from_utc,
+                        effective_to_utc,
                         utc_offset_minutes,
-                        proof_source,
+                        evidence_reference,
                         is_dst,
                     ),
                 ).fetchone()
@@ -414,39 +504,47 @@ class MarketTimeStore:
             raise
         except Exception as exc:
             raise MarketTimeStoreError(
-                "Unable to record broker offset history"
+                "Unable to record UTC broker offset history"
             ) from exc
 
-    async def add_offset_period(
+    async def add_utc_offset_period(
         self,
         *,
         source_id: str,
-        broker_local_from: datetime,
-        broker_local_to: datetime | None,
+        effective_from_utc: datetime,
+        effective_to_utc: datetime | None,
         utc_offset_minutes: int,
-        proof_source: str,
+        evidence_reference: str,
         is_dst: bool | None = None,
     ) -> int:
-        """Record an unverified offset period without converting timestamps."""
+        """
+        Record a new UTC-bounded offset period.
+
+        Period semantics are [effective_from_utc, effective_to_utc).
+        A missing end means the period is open-ended.
+
+        All records are UNVERIFIED. This method does not convert
+        broker-local timestamps or establish trust.
+        """
         source_id = self._validate_source_id(source_id)
 
-        start = self._validate_local_datetime(
-            broker_local_from,
-            "broker_local_from",
+        start = self._validate_utc_datetime(
+            effective_from_utc,
+            "effective_from_utc",
         )
 
         end = (
             None
-            if broker_local_to is None
-            else self._validate_local_datetime(
-                broker_local_to,
-                "broker_local_to",
+            if effective_to_utc is None
+            else self._validate_utc_datetime(
+                effective_to_utc,
+                "effective_to_utc",
             )
         )
 
         if end is not None and end <= start:
             raise MarketTimeStoreError(
-                "Offset period end must be after its start"
+                "UTC offset period end must be after its start"
             )
 
         if (
@@ -458,15 +556,15 @@ class MarketTimeStore:
                 "UTC offset is outside the allowed range"
             )
 
-        proof_source = self._validate_text(
-            proof_source,
-            "proof source",
-            256,
+        evidence_reference = self._validate_text(
+            evidence_reference,
+            "evidence reference",
+            512,
         )
 
-        if proof_source is None:
+        if evidence_reference is None:
             raise MarketTimeStoreError(
-                "Proof source is required"
+                "Evidence reference is required"
             )
 
         if not isinstance(is_dst, (bool, type(None))):
@@ -475,11 +573,11 @@ class MarketTimeStore:
             )
 
         return await asyncio.to_thread(
-            self._add_offset_period_sync,
+            self._add_utc_offset_period_sync,
             source_id=source_id,
-            broker_local_from=start,
-            broker_local_to=end,
+            effective_from_utc=start,
+            effective_to_utc=end,
             utc_offset_minutes=utc_offset_minutes,
-            proof_source=proof_source,
+            evidence_reference=evidence_reference,
             is_dst=is_dst,
         )
