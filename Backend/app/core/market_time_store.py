@@ -147,207 +147,108 @@ class MarketTimeStore:
         return value.astimezone(timezone.utc)
 
     def _initialize_sync(self) -> None:
+        required_columns = {
+            "gold_bot_device_time_config": {
+                "source_id",
+                "broker_name",
+                "server_name",
+                "timezone_name",
+                "time_source",
+                "reported_utc_offset_minutes",
+                "config_status",
+                "updated_at",
+            },
+            "gold_bot_time_offset_history": {
+                "id",
+                "source_id",
+                "broker_local_from",
+                "broker_local_to",
+                "utc_offset_minutes",
+                "proof_source",
+                "is_dst",
+                "validation_status",
+                "recorded_at",
+            },
+            "gold_bot_time_offset_history_v2": {
+                "id",
+                "source_id",
+                "effective_from_utc",
+                "effective_to_utc",
+                "utc_offset_minutes",
+                "evidence_reference",
+                "is_dst",
+                "validation_status",
+                "recorded_at",
+            },
+        }
+
         try:
             with self._connect() as connection:
-
-                connection.execute(
+                rows = connection.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_device_time_config (
-                        source_id VARCHAR(128) PRIMARY KEY,
-                        broker_name VARCHAR(128),
-                        server_name VARCHAR(128),
-                        timezone_name VARCHAR(64),
-                        time_source VARCHAR(32) NOT NULL
-                            DEFAULT 'MT5_SERVER_TIME',
-                        reported_utc_offset_minutes SMALLINT,
-                        config_status VARCHAR(16) NOT NULL
-                            DEFAULT 'UNVERIFIED',
-                        updated_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = ANY(%s)
+                    """,
+                    (list(required_columns),),
+                ).fetchall()
 
-                        CONSTRAINT ck_device_time_config_offset
-                            CHECK (
-                                reported_utc_offset_minutes IS NULL
-                                OR reported_utc_offset_minutes
-                                    BETWEEN -720 AND 840
-                            ),
+                actual = {}
 
-                        CONSTRAINT ck_device_time_config_status
-                            CHECK (
-                                config_status IN (
-                                    'UNVERIFIED',
-                                    'VERIFIED',
-                                    'REJECTED'
-                                )
-                            )
+                for table_name, column_name in rows:
+                    actual.setdefault(table_name, set()).add(
+                        column_name
+                    )
+
+                problems = []
+
+                for table_name, expected in required_columns.items():
+                    actual_columns = actual.get(table_name, set())
+
+                    if not actual_columns:
+                        problems.append(
+                            f"Missing table: {table_name}"
+                        )
+                        continue
+
+                    missing = expected - actual_columns
+
+                    if missing:
+                        problems.append(
+                            f"{table_name} missing columns: "
+                            f"{', '.join(sorted(missing))}"
+                        )
+
+                exclusion_exists = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname =
+                            'ex_time_offset_v2_no_overlap'
+                          AND conrelid = to_regclass(
+                            'gold_bot_time_offset_history_v2'
+                          )
+                          AND contype = 'x'
                     )
                     """
-                )
+                ).fetchone()[0]
 
-                # Preserve the legacy table exactly.
-                # Historical local-time records are never
-                # automatically reinterpreted.
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_time_offset_history (
-                        id BIGINT GENERATED ALWAYS AS IDENTITY
-                            PRIMARY KEY,
-
-                        source_id VARCHAR(128) NOT NULL
-                            REFERENCES gold_bot_device_time_config(
-                                source_id
-                            ) ON DELETE RESTRICT,
-
-                        broker_local_from TIMESTAMP WITHOUT TIME ZONE
-                            NOT NULL,
-
-                        broker_local_to TIMESTAMP WITHOUT TIME ZONE,
-
-                        utc_offset_minutes SMALLINT NOT NULL,
-                        proof_source VARCHAR(256) NOT NULL,
-                        is_dst BOOLEAN,
-
-                        validation_status VARCHAR(16) NOT NULL
-                            DEFAULT 'UNVERIFIED',
-
-                        recorded_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-
-                        CONSTRAINT ck_time_offset_range
-                            CHECK (
-                                utc_offset_minutes
-                                BETWEEN -720 AND 840
-                            ),
-
-                        CONSTRAINT ck_time_offset_period
-                            CHECK (
-                                broker_local_to IS NULL
-                                OR broker_local_to > broker_local_from
-                            ),
-
-                        CONSTRAINT ck_time_offset_status
-                            CHECK (
-                                validation_status IN (
-                                    'UNVERIFIED',
-                                    'VERIFIED',
-                                    'REJECTED'
-                                )
-                            )
+                if not exclusion_exists:
+                    problems.append(
+                        "Missing V2 time overlap exclusion constraint"
                     )
-                    """
-                )
 
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_time_offset_history_source_period
-                    ON gold_bot_time_offset_history (
-                        source_id,
-                        broker_local_from
+                if problems:
+                    raise MarketTimeStoreError(
+                        "Database schema is not migrated correctly. "
+                        "Run alembic upgrade head. Details: "
+                        + "; ".join(problems)
                     )
-                    """
-                )
 
-                # New UTC-based history table.
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_time_offset_history_v2 (
-                        id BIGINT GENERATED ALWAYS AS IDENTITY
-                            PRIMARY KEY,
-
-                        source_id VARCHAR(128) NOT NULL
-                            REFERENCES gold_bot_device_time_config(
-                                source_id
-                            ) ON DELETE RESTRICT,
-
-                        effective_from_utc TIMESTAMPTZ NOT NULL,
-                        effective_to_utc TIMESTAMPTZ,
-
-                        utc_offset_minutes SMALLINT NOT NULL,
-
-                        evidence_reference VARCHAR(512) NOT NULL,
-
-                        is_dst BOOLEAN,
-
-                        validation_status VARCHAR(16) NOT NULL
-                            DEFAULT 'UNVERIFIED',
-
-                        recorded_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-
-                        CONSTRAINT ck_time_offset_v2_range
-                            CHECK (
-                                utc_offset_minutes
-                                BETWEEN -720 AND 840
-                            ),
-
-                        CONSTRAINT ck_time_offset_v2_period
-                            CHECK (
-                                effective_to_utc IS NULL
-                                OR effective_to_utc > effective_from_utc
-                            ),
-
-                        CONSTRAINT ck_time_offset_v2_status
-                            CHECK (
-                                validation_status IN (
-                                    'UNVERIFIED',
-                                    'VERIFIED',
-                                    'REJECTED'
-                                )
-                            )
-                    )
-                    """
-                )
-
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_time_offset_history_v2_source_period
-                    ON gold_bot_time_offset_history_v2 (
-                        source_id,
-                        effective_from_utc
-                    )
-                    """
-                )
-
-                # إضافة قيد الاستبعاد لمنع التداخلات الزمنية (Exclusion Constraint)
-                connection.execute(
-                    """
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1
-                            FROM pg_constraint
-                            WHERE conname =
-                                'ex_time_offset_v2_no_overlap'
-                              AND conrelid =
-                                'gold_bot_time_offset_history_v2'
-                                ::regclass
-                        ) THEN
-                            ALTER TABLE
-                                gold_bot_time_offset_history_v2
-                            ADD CONSTRAINT
-                                ex_time_offset_v2_no_overlap
-                            EXCLUDE USING gist (
-                                source_id WITH =,
-                                tstzrange(
-                                    effective_from_utc,
-                                    effective_to_utc,
-                                    '[)'
-                                ) WITH &&
-                            )
-                            WHERE (
-                                validation_status <> 'REJECTED'
-                            );
-                        END IF;
-                    END
-                    $$
-                    """
-                )
-
+        except MarketTimeStoreError:
+            raise
         except Exception as exc:
             raise MarketTimeStoreError(
                 "Unable to initialize broker-time storage"
@@ -355,8 +256,8 @@ class MarketTimeStore:
 
     async def initialize(self) -> None:
         """
-        Create storage tables without modifying existing
-        market-data records or legacy offset records.
+        Verify that Alembic-managed broker-time tables exist.
+        This method never creates or alters database objects.
         """
         await asyncio.to_thread(self._initialize_sync)
 
