@@ -1,3 +1,4 @@
+
 import asyncio
 from contextlib import asynccontextmanager
 import logging
@@ -10,6 +11,7 @@ from app.core.config import settings
 from app.core.device_registry import DeviceRegistry
 from app.core.device_secret_crypto import DeviceSecretCipher
 from app.core.market_data_store import MarketDataStore
+from app.core.market_time_store import MarketTimeStore
 from app.core.nonce_cleanup import run_nonce_cleanup
 from app.core.postgres_nonce_store import PostgresNonceStore
 
@@ -26,6 +28,7 @@ async def lifespan(app: FastAPI):
     app.state.device_registry = None
     app.state.nonce_store = None
     app.state.market_data_store = None
+    app.state.market_time_store = None
     app.state.nonce_cleanup_task = None
 
     logger.info("GOLD BOT backend starting")
@@ -52,17 +55,20 @@ async def lifespan(app: FastAPI):
 
             market_data_store = MarketDataStore(database_url)
 
+            market_time_store = MarketTimeStore(database_url)
+
             # Initialize every required store before accepting data.
             await nonce_store.initialize()
             await device_registry.initialize()
             await market_data_store.initialize()
+            await market_time_store.initialize()
 
             app.state.nonce_store = nonce_store
             app.state.device_registry = device_registry
             app.state.market_data_store = market_data_store
+            app.state.market_time_store = market_time_store
             app.state.database_status = "CONNECTED"
 
-            # Start cleanup only after nonce storage is ready.
             cleanup_task = asyncio.create_task(
                 run_nonce_cleanup(nonce_store),
                 name="gold-bot-nonce-cleanup",
@@ -71,7 +77,8 @@ async def lifespan(app: FastAPI):
             app.state.nonce_cleanup_task = cleanup_task
 
             logger.info(
-                "Market-data security and storage initialized"
+                "Market-data security, storage, and broker-time "
+                "storage initialized"
             )
 
         else:
@@ -220,6 +227,11 @@ async def system_status():
             if app.state.market_data_store is not None
             else "disabled"
         ),
+        "market_time_store_status": (
+            "initialized"
+            if app.state.market_time_store is not None
+            else "disabled"
+        ),
         "nonce_cleanup_status": (
             "running" if cleanup_running else "stopped"
         ),
@@ -233,7 +245,7 @@ async def unexpected_exception_handler(
     exc: Exception,
 ):
     logger.exception(
-        "Unhandled backend exception on %s %s",
+        "Unhandled exception on %s %s",
         request.method,
         request.url.path,
     )
