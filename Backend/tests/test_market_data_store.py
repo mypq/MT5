@@ -302,3 +302,436 @@ def test_non_postgresql_database_url_is_rejected():
         MarketDataStore(
             "sqlite:///test.db"
   )
+
+@pytest.mark.asyncio
+async def test_invalid_source_identifier_is_rejected(monkeypatch):
+    connection = FakeConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message(source_id="invalid source!")
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Invalid market-data source identifier",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
+@pytest.mark.asyncio
+async def test_non_uuid_message_id_is_rejected(monkeypatch):
+    connection = FakeConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message()
+    message["message_id"] = "not-a-uuid"
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Message ID must be a UUID",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
+@pytest.mark.asyncio
+async def test_non_datetime_timestamp_is_rejected(monkeypatch):
+    connection = FakeConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message(sent_at="2026-11-12T10:00:00Z")
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="must be a datetime",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
+@pytest.mark.asyncio
+async def test_non_dictionary_payload_is_rejected(monkeypatch):
+    connection = FakeConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message(payload=["invalid"])
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="payload must be a JSON object",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
+@pytest.mark.asyncio
+async def test_non_bytes_raw_body_is_rejected(monkeypatch):
+    connection = FakeConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message(raw_body='{"test": true}')
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Exact raw request body is required",
+    ):
+        await store.store_message(**message)
+
+    assert connection.executed_statements == []
+
+
+@pytest.mark.asyncio
+async def test_raw_body_sha256_is_stored(monkeypatch):
+    raw_body = b'{"source":"MT5","value":123}'
+    message = build_message(raw_body=raw_body)
+
+    connection = FakeConnection(insert_result=(1,))
+    store = create_store(monkeypatch, connection)
+
+    result = await store.store_message(**message)
+
+    assert result is True
+
+    query, parameters = connection.executed_statements[0]
+
+    expected_hash = hashlib.sha256(raw_body).hexdigest()
+
+    assert parameters[4] == expected_hash
+    assert "body_sha256" in query
+
+
+@pytest.mark.asyncio
+async def test_sent_at_is_normalized_to_utc_before_storage(monkeypatch):
+    from datetime import timedelta
+
+    original_time = datetime(
+        2026, 11, 12, 15, 30,
+        tzinfo=timezone(timedelta(hours=3)),
+    )
+
+    message = build_message(sent_at=original_time)
+
+    connection = FakeConnection(insert_result=(1,))
+    store = create_store(monkeypatch, connection)
+
+    await store.store_message(**message)
+
+    parameters = connection.executed_statements[0][1]
+    stored_time = parameters[3]
+
+    assert stored_time.tzinfo == timezone.utc
+    assert stored_time == datetime(
+        2026, 11, 12, 12, 30,
+        tzinfo=timezone.utc,
+    )
+
+
+class FailingDatabaseConnection:
+    def __enter__(self):
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+        return False
+
+    def execute(self, query, parameters=None):
+        raise RuntimeError("simulated database failure")
+
+
+@pytest.mark.asyncio
+async def test_database_failure_is_wrapped_as_store_error(monkeypatch):
+    connection = FailingDatabaseConnection()
+    store = create_store(monkeypatch, connection)
+
+    message = build_message()
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Unable to persist market-data message",
+    ) as error:
+        await store.store_message(**message)
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
+def test_postgresql_psycopg_url_is_accepted():
+    store = MarketDataStore(
+        "postgresql+psycopg://test:test@localhost/test_db"
+    )
+
+    assert store._database_url == (
+        "postgresql://test:test@localhost/test_db"
+    )
+
+
+def test_non_string_database_url_is_rejected():
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Database URL must be a string",
+    ):
+        MarketDataStore(None)
+
+class FakeSchemaConnection:
+    def __init__(
+        self,
+        *,
+        columns=None,
+        constraints=None,
+        indexes=None,
+        fail_on=None,
+    ):
+        self.columns = columns
+        self.constraints = constraints
+        self.indexes = indexes
+        self.fail_on = fail_on
+        self.executed_statements = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
+        return False
+
+    def execute(self, query, parameters=None):
+        self.executed_statements.append(
+            (query, parameters)
+        )
+
+        if self.fail_on and self.fail_on in query:
+            raise RuntimeError("simulated schema failure")
+
+        if "information_schema.columns" in query:
+            return FakeCursor(
+                [(column,) for column in (self.columns or [])]
+            )
+
+        if "FROM pg_constraint" in query:
+            return FakeCursor(
+                self.constraints or []
+            )
+
+        if "FROM pg_index" in query:
+            return FakeCursor(
+                self.indexes or []
+            )
+
+        raise AssertionError(
+            "Unexpected schema SQL statement"
+        )
+
+
+def valid_schema_connection():
+    return FakeSchemaConnection(
+        columns=MarketDataStore._REQUIRED_COLUMNS,
+        constraints=[
+            ("uq_market_data_message", "u"),
+            ("ck_market_data_message_type", "c"),
+        ],
+        indexes=[
+            ("idx_market_data_source_received", True, True),
+            ("idx_market_data_type_sent", True, True),
+        ],
+    )
+
+
+def create_schema_store(monkeypatch, connection):
+    store = MarketDataStore(
+        "postgresql://test:test@localhost/test_db"
+    )
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        lambda: connection,
+    )
+
+    return store
+
+
+@pytest.mark.asyncio
+async def test_initialize_accepts_complete_schema(monkeypatch):
+    connection = valid_schema_connection()
+    store = create_schema_store(monkeypatch, connection)
+
+    await store.initialize()
+
+    assert len(connection.executed_statements) == 3
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_table(monkeypatch):
+    connection = FakeSchemaConnection(
+        columns=[],
+        constraints=[],
+        indexes=[],
+    )
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Missing table",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_columns(monkeypatch):
+    columns = (
+        MarketDataStore._REQUIRED_COLUMNS
+        - {"body_sha256", "payload"}
+    )
+
+    connection = valid_schema_connection()
+    connection.columns = columns
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Missing market-data columns",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_unique_constraint(
+    monkeypatch,
+):
+    connection = valid_schema_connection()
+    connection.constraints = [
+        ("ck_market_data_message_type", "c"),
+    ]
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Missing market-data unique constraint",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_check_constraint(
+    monkeypatch,
+):
+    connection = valid_schema_connection()
+    connection.constraints = [
+        ("uq_market_data_message", "u"),
+    ]
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Missing market-data message type constraint",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_missing_index(monkeypatch):
+    connection = valid_schema_connection()
+    connection.indexes = [
+        ("idx_market_data_source_received", True, True),
+    ]
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Missing market-data index",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_invalid_index(monkeypatch):
+    connection = valid_schema_connection()
+    connection.indexes = [
+        ("idx_market_data_source_received", False, True),
+        ("idx_market_data_type_sent", True, True),
+    ]
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Invalid market-data index",
+    ):
+        await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_never_executes_schema_creation(monkeypatch):
+    connection = valid_schema_connection()
+    store = create_schema_store(monkeypatch, connection)
+
+    await store.initialize()
+
+    executed_sql = "\n".join(
+        query
+        for query, _ in connection.executed_statements
+    ).upper()
+
+    assert "CREATE TABLE" not in executed_sql
+    assert "ALTER TABLE" not in executed_sql
+    assert "CREATE INDEX" not in executed_sql
+    assert "DROP TABLE" not in executed_sql
+
+
+@pytest.mark.asyncio
+async def test_initialize_wraps_database_errors(monkeypatch):
+    connection = FakeSchemaConnection(
+        fail_on="information_schema.columns",
+    )
+
+    store = create_schema_store(monkeypatch, connection)
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Unable to initialize market-data storage",
+    ) as error:
+        await store.initialize()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_database_connection_failure(
+    monkeypatch,
+):
+    store = MarketDataStore(
+        "postgresql://test:test@localhost/test_db"
+    )
+
+    def fail_connection():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        store,
+        "_connect",
+        fail_connection,
+    )
+
+    with pytest.raises(
+        MarketDataStoreError,
+        match="Unable to initialize market-data storage",
+    ) as error:
+        await store.initialize()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
