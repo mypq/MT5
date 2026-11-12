@@ -16,6 +16,90 @@ pytestmark = pytest.mark.skipif(
     reason="PostgreSQL integration database is not configured",
 )
 
+_TEST_SOURCE_IDS = set()
+
+
+def _create_test_time_config(connection, source_id):
+    _TEST_SOURCE_IDS.add(source_id)
+
+    connection.execute(
+        """
+        INSERT INTO gold_bot_device_time_config (source_id)
+        VALUES (%s)
+        """,
+        (source_id,),
+    )
+
+
+def _insert_v2_period(
+    connection,
+    source_id,
+    start,
+    end,
+    status="VERIFIED",
+    offset=180,
+):
+    _TEST_SOURCE_IDS.add(source_id)
+
+    connection.execute(
+        """
+        INSERT INTO gold_bot_time_offset_history_v2 (
+            source_id,
+            effective_from_utc,
+            effective_to_utc,
+            utc_offset_minutes,
+            evidence_reference,
+            validation_status
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            source_id,
+            start,
+            end,
+            offset,
+            "Constraint enforcement test",
+            status,
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def cleanup_constraint_test_data():
+    yield
+
+    if not DATABASE_URL or not _TEST_SOURCE_IDS:
+        return
+
+    source_ids = list(_TEST_SOURCE_IDS)
+    _TEST_SOURCE_IDS.clear()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        for source_id in source_ids:
+            connection.execute(
+                """
+                DELETE FROM gold_bot_time_offset_history_v2
+                WHERE source_id = %s
+                """,
+                (source_id,),
+            )
+
+            connection.execute(
+                """
+                DELETE FROM gold_bot_time_offset_history
+                WHERE source_id = %s
+                """,
+                (source_id,),
+            )
+
+            connection.execute(
+                """
+                DELETE FROM gold_bot_device_time_config
+                WHERE source_id = %s
+                """,
+                (source_id,),
+            )
+
 
 def test_baseline_migration_preserves_existing_data(monkeypatch):
     source_id = "MIGRATION-TEST-" + uuid.uuid4().hex
@@ -124,11 +208,7 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
                 ),
             )
 
-        # Remove only Alembic's revision marker.
-        # The baseline downgrade intentionally preserves all data.
         command.downgrade(config, "base")
-
-        # Re-adopt the existing database schema.
         command.upgrade(config, "head")
 
         with psycopg.connect(DATABASE_URL) as connection:
@@ -200,10 +280,12 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
         )
 
         assert len(v2) == 2
+
         assert v2[0][2:] == (
             "Verified migration preservation",
             "VERIFIED",
         )
+
         assert v2[1][2:] == (
             "Rejected migration preservation",
             "REJECTED",
@@ -237,45 +319,6 @@ def test_baseline_migration_preserves_existing_data(monkeypatch):
                 """,
                 (source_id,),
             )
-def _create_test_time_config(connection, source_id):
-    connection.execute(
-        """
-        INSERT INTO gold_bot_device_time_config (source_id)
-        VALUES (%s)
-        """,
-        (source_id,),
-    )
-
-
-def _insert_v2_period(
-    connection,
-    source_id,
-    start,
-    end,
-    status="VERIFIED",
-    offset=180,
-):
-    connection.execute(
-        """
-        INSERT INTO gold_bot_time_offset_history_v2 (
-            source_id,
-            effective_from_utc,
-            effective_to_utc,
-            utc_offset_minutes,
-            evidence_reference,
-            validation_status
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (
-            source_id,
-            start,
-            end,
-            offset,
-            "Constraint enforcement test",
-            status,
-        ),
-    )
 
 
 def test_v2_rejects_offset_outside_allowed_range():
