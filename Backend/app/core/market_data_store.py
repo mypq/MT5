@@ -1,3 +1,4 @@
+
 import asyncio
 import hashlib
 import re
@@ -21,12 +22,8 @@ class MarketDataStore:
     """
     PostgreSQL storage for authenticated MT5 market-data messages.
 
-    Stores the validated JSON payload, its exact-body SHA-256
-    digest, source identity, message identity, and send time.
-
-    A repeated identical message is treated as an idempotent
-    duplicate. Reusing a message ID with different content
-    is rejected.
+    Database schema is managed exclusively by Alembic.
+    This class validates the schema and persists messages.
     """
 
     _TABLE_NAME = "gold_bot_market_data_messages"
@@ -39,6 +36,17 @@ class MarketDataStore:
         "candles",
         "account",
         "positions",
+    }
+
+    _REQUIRED_COLUMNS = {
+        "id",
+        "source_id",
+        "message_type",
+        "message_id",
+        "sent_at",
+        "received_at",
+        "body_sha256",
+        "payload",
     }
 
     def __init__(self, database_url: str) -> None:
@@ -85,7 +93,10 @@ class MarketDataStore:
         payload: dict[str, Any],
         raw_body: bytes,
     ) -> str:
-        if message_type not in cls._MESSAGE_TYPES:
+        if (
+            not isinstance(message_type, str)
+            or message_type not in cls._MESSAGE_TYPES
+        ):
             raise MarketDataStoreError(
                 "Unsupported market-data message type"
             )
@@ -103,11 +114,19 @@ class MarketDataStore:
                 "Message ID must be a UUID"
             )
 
-        if (
-            not isinstance(sent_at, datetime)
-            or sent_at.tzinfo is None
-            or sent_at.utcoffset() is None
-        ):
+        if not isinstance(sent_at, datetime):
+            raise MarketDataStoreError(
+                "Message timestamp must be a datetime"
+            )
+
+        try:
+            offset = sent_at.utcoffset()
+        except Exception as exc:
+            raise MarketDataStoreError(
+                "Message timestamp has invalid timezone information"
+            ) from exc
+
+        if sent_at.tzinfo is None or offset is None:
             raise MarketDataStoreError(
                 "Message timestamp must include a timezone"
             )
@@ -117,7 +136,10 @@ class MarketDataStore:
                 "Market-data payload must be a JSON object"
             )
 
-        if not isinstance(raw_body, bytes) or not raw_body:
+        if (
+            not isinstance(raw_body, bytes)
+            or not raw_body
+        ):
             raise MarketDataStoreError(
                 "Exact raw request body is required"
             )
@@ -137,68 +159,130 @@ class MarketDataStore:
     def _initialize_sync(self) -> None:
         try:
             with self._connect() as connection:
-                connection.execute(
+                rows = connection.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_market_data_messages (
-                        id BIGINT GENERATED ALWAYS AS IDENTITY
-                            PRIMARY KEY,
-                        source_id VARCHAR(128) NOT NULL,
-                        message_type VARCHAR(16) NOT NULL,
-                        message_id UUID NOT NULL,
-                        sent_at TIMESTAMPTZ NOT NULL,
-                        received_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-                        body_sha256 CHAR(64) NOT NULL,
-                        payload JSONB NOT NULL,
-                        CONSTRAINT uq_market_data_message
-                            UNIQUE (
-                                source_id,
-                                message_type,
-                                message_id
-                            ),
-                        CONSTRAINT ck_market_data_message_type
-                            CHECK (
-                                message_type IN (
-                                    'candles',
-                                    'account',
-                                    'positions'
-                                )
-                            )
-                    )
-                    """
-                )
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
 
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_market_data_source_received
-                    ON gold_bot_market_data_messages (
-                        source_id,
-                        received_at DESC
-                    )
-                    """
-                )
+                actual_columns = {
+                    row[0] for row in rows
+                }
 
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_market_data_type_sent
-                    ON gold_bot_market_data_messages (
-                        message_type,
-                        sent_at DESC
-                    )
-                    """
-                )
+                problems = []
 
+                if not actual_columns:
+                    problems.append(
+                        f"Missing table: {self._TABLE_NAME}"
+                    )
+                else:
+                    missing = (
+                        self._REQUIRED_COLUMNS
+                        - actual_columns
+                    )
+
+                    if missing:
+                        problems.append(
+                            "Missing market-data columns: "
+                            + ", ".join(sorted(missing))
+                        )
+
+                constraints = connection.execute(
+                    """
+                    SELECT conname, contype
+                    FROM pg_constraint
+                    WHERE conrelid = to_regclass(%s)
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_constraints = {
+                    name: constraint_type
+                    for name, constraint_type in constraints
+                }
+
+                if actual_constraints.get(
+                    "uq_market_data_message"
+                ) != "u":
+                    problems.append(
+                        "Missing market-data unique constraint"
+                    )
+
+                if actual_constraints.get(
+                    "ck_market_data_message_type"
+                ) != "c":
+                    problems.append(
+                        "Missing market-data message type constraint"
+                    )
+
+                indexes = connection.execute(
+                    """
+                    SELECT
+                        idx.relname,
+                        i.indisvalid,
+                        i.indisready
+                    FROM pg_index i
+                    JOIN pg_class idx
+                      ON idx.oid = i.indexrelid
+                    JOIN pg_class tbl
+                      ON tbl.oid = i.indrelid
+                    JOIN pg_namespace ns
+                      ON ns.oid = tbl.relnamespace
+                    WHERE ns.nspname = current_schema()
+                      AND tbl.relname = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_indexes = {
+                    name: (is_valid, is_ready)
+                    for name, is_valid, is_ready in indexes
+                }
+
+                required_indexes = {
+                    "idx_market_data_source_received",
+                    "idx_market_data_type_sent",
+                }
+
+                for index_name in required_indexes:
+                    index_state = actual_indexes.get(index_name)
+
+                    if index_state is None:
+                        problems.append(
+                            f"Missing market-data index: {index_name}"
+                        )
+                    elif not all(index_state):
+                        problems.append(
+                            f"Invalid market-data index: {index_name}"
+                        )
+
+                if problems:
+                    raise MarketDataStoreError(
+                        "Database schema is not migrated correctly. "
+                        "Run alembic upgrade head. Details: "
+                        + "; ".join(problems)
+                    )
+
+        except MarketDataStoreError:
+            raise
         except Exception as exc:
             raise MarketDataStoreError(
                 "Unable to initialize market-data storage"
             ) from exc
 
     async def initialize(self) -> None:
-        """Create the market-data table and indexes."""
-        await asyncio.to_thread(self._initialize_sync)
+        """
+        Verify Alembic-managed market-data schema.
+
+        This method never creates or alters database objects.
+        """
+        await asyncio.to_thread(
+            self._initialize_sync
+        )
 
     def _store_message_sync(
         self,
