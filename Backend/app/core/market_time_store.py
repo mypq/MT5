@@ -2,6 +2,7 @@
 import asyncio
 import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 
@@ -101,7 +102,10 @@ class MarketTimeStore:
             64,
         )
 
-        if value is not None and (
+        if value is None:
+            return None
+
+        if (
             value.startswith("/")
             or ".." in value
             or not cls._TIMEZONE_PATTERN.fullmatch(value)
@@ -109,6 +113,13 @@ class MarketTimeStore:
             raise MarketTimeStoreError(
                 "Invalid timezone identifier"
             )
+
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise MarketTimeStoreError(
+                "Unknown IANA timezone identifier"
+            ) from exc
 
         return value
 
