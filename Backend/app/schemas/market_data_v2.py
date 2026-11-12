@@ -1,8 +1,8 @@
 
+import re
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
-import re
 
 from pydantic import Field, field_validator, model_validator
 
@@ -21,29 +21,46 @@ class BrokerTimeMetadataV2(StrictModel):
     time_source: Literal["MT5_SERVER_TIME"] = "MT5_SERVER_TIME"
 
     broker_name: str | None = Field(
-        default=None, min_length=1, max_length=128
+        default=None,
+        min_length=1,
+        max_length=128,
     )
+
     server_name: str | None = Field(
-        default=None, min_length=1, max_length=128
+        default=None,
+        min_length=1,
+        max_length=128,
     )
+
     timezone_name: str | None = Field(
-        default=None, min_length=1, max_length=64
+        default=None,
+        min_length=1,
+        max_length=64,
     )
 
-    # Informational only; never use this alone for historical conversion.
+    # Informational only. Never use this alone for historical conversion.
     reported_utc_offset_minutes: int | None = Field(
-        default=None, ge=-720, le=840
+        default=None,
+        ge=-720,
+        le=840,
     )
 
-    @field_validator("broker_name", "server_name", "timezone_name")
+    @field_validator(
+        "broker_name",
+        "server_name",
+        "timezone_name",
+    )
     @classmethod
     def normalize_optional_text(cls, value):
         if value is None:
             return None
 
         normalized = value.strip()
+
         if not normalized:
-            raise ValueError("Broker time metadata cannot be blank")
+            raise ValueError(
+                "Broker time metadata cannot be blank"
+            )
 
         return normalized
 
@@ -61,7 +78,9 @@ class BrokerTimeMetadataV2(StrictModel):
                 value,
             )
         ):
-            raise ValueError("Invalid timezone identifier format")
+            raise ValueError(
+                "Invalid timezone identifier format"
+            )
 
         return value
 
@@ -80,6 +99,24 @@ class MarketCandleV2(StrictModel):
     spread_points: int = Field(ge=0)
 
     is_closed: Literal[True]
+
+    @field_validator(
+        "broker_open_time",
+        mode="before",
+    )
+    @classmethod
+    def require_exact_broker_time_format(cls, value):
+        if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+            value,
+        ):
+            raise ValueError(
+                "broker_open_time must use "
+                "YYYY-MM-DDTHH:MM:SS "
+                "without a timezone or UTC suffix"
+            )
+
+        return value
 
     @field_validator("broker_open_time")
     @classmethod
@@ -115,10 +152,16 @@ class MarketDataBatchV2(StrictModel):
     schema_version: Literal[2] = 2
 
     message_id: UUID
-    source_id: str = Field(min_length=1, max_length=128)
+
+    source_id: str = Field(
+        min_length=1,
+        max_length=128,
+    )
 
     symbol: Literal["XAUUSD"] = "XAUUSD"
+
     timeframe: MarketTimeframe
+
     sent_at: datetime
 
     volume_source: VolumeSource = VolumeSource.UNKNOWN
@@ -133,7 +176,10 @@ class MarketDataBatchV2(StrictModel):
     @field_validator("sent_at")
     @classmethod
     def validate_sent_at(cls, value):
-        return reject_future_datetime(value, "sent_at")
+        return reject_future_datetime(
+            value,
+            "sent_at",
+        )
 
     @field_validator("source_id")
     @classmethod
@@ -157,6 +203,6 @@ class MarketDataBatchV2(StrictModel):
                 "Duplicate broker candle times are not allowed"
             )
 
-        # Broker wall-clock time must not be compared with UTC sent_at.
+        # Never compare broker wall-clock time with UTC sent_at.
         # Conversion requires a separately verified timezone mapping.
         return self
