@@ -71,6 +71,11 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q app tests scripts
 
+      - name: Apply database migrations
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/gold_bot_test
+        run: alembic upgrade head
+
       - name: Run backend tests
         env:
           MARKET_TIME_TEST_DATABASE_URL: postgresql://postgres:postgres_test_password@localhost:5432/gold_bot_test
