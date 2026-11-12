@@ -1,4 +1,3 @@
-
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -9,7 +8,9 @@ from app.schemas.market_data import (
     AccountMode,
     AccountSnapshot,
     MarketCandle,
+    MarketCandleV2,
     MarketDataBatch,
+    MarketDataBatchV2,
     MarketTimeframe,
     OpenPosition,
     OpenPositionsSnapshot,
@@ -299,3 +300,127 @@ def test_market_batch_rejects_candle_starting_after_sent_at():
         match="Latest candle cannot start after sent_at",
     ):
         MarketDataBatch.model_validate(payload)
+
+
+def valid_market_batch_v2():
+    now = utc_now()
+
+    return {
+        "schema_version": 2,
+        "message_id": str(uuid4()),
+        "source_id": "MT5-DEMO-01",
+        "symbol": "XAUUSD",
+        "timeframe": "M1",
+        "sent_at": now,
+        "volume_source": "TICK",
+        "candles": [
+            {
+                "broker_local_time": datetime(2026, 1, 1, 10, 0),
+                "open": 2650.0,
+                "high": 2660.0,
+                "low": 2640.0,
+                "close": 2655.0,
+                "tick_volume": 120,
+                "real_volume": 0,
+                "spread_points": 25,
+                "is_closed": True,
+            },
+            {
+                "broker_local_time": datetime(2026, 1, 1, 10, 1),
+                "open": 2655.0,
+                "high": 2665.0,
+                "low": 2650.0,
+                "close": 2660.0,
+                "tick_volume": 130,
+                "real_volume": 0,
+                "spread_points": 25,
+                "is_closed": True,
+            },
+        ],
+    }
+
+
+def test_market_batch_v2_accepts_broker_local_times():
+    batch = MarketDataBatchV2.model_validate(
+        valid_market_batch_v2()
+    )
+
+    assert batch.schema_version == 2
+    assert len(batch.candles) == 2
+    assert batch.candles[0].broker_local_time == datetime(
+        2026, 1, 1, 10, 0
+    )
+
+
+def test_market_batch_v2_rejects_timezone_aware_candle_time():
+    payload = valid_market_batch_v2()
+
+    payload["candles"][0]["broker_local_time"] = (
+        datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="must not contain timezone data",
+    ):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_duplicate_local_times():
+    payload = valid_market_batch_v2()
+
+    payload["candles"][1]["broker_local_time"] = (
+        payload["candles"][0]["broker_local_time"]
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="Duplicate broker-local",
+    ):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_unordered_local_times():
+    payload = valid_market_batch_v2()
+    payload["candles"].reverse()
+
+    with pytest.raises(
+        ValidationError,
+        match="chronologically",
+    ):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_unknown_schema_version():
+    payload = valid_market_batch_v2()
+    payload["schema_version"] = 3
+
+    with pytest.raises(ValidationError):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_invalid_ohlc():
+    payload = valid_market_batch_v2()
+    payload["candles"][0]["high"] = 2630.0
+
+    with pytest.raises(
+        ValidationError,
+        match="high cannot be below",
+    ):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_unclosed_candle():
+    payload = valid_market_batch_v2()
+    payload["candles"][0]["is_closed"] = False
+
+    with pytest.raises(ValidationError):
+        MarketDataBatchV2.model_validate(payload)
+
+
+def test_market_batch_v2_rejects_unknown_fields():
+    payload = valid_market_batch_v2()
+    payload["unexpected"] = "not allowed"
+
+    with pytest.raises(ValidationError):
+        MarketDataBatchV2.model_validate(payload)
