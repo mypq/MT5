@@ -1,3 +1,4 @@
+
 import asyncio
 import re
 
@@ -17,14 +18,21 @@ class DeviceRegistry:
     """
     PostgreSQL-backed registry for trusted MT5 devices.
 
+    Database schema is managed exclusively by Alembic.
     Device secrets are stored encrypted, never as plaintext.
-
-    Enrollment must be performed by a trusted administrative
-    process. Public API requests must never register devices.
     """
 
     _SOURCE_PATTERN = re.compile(r"^[^\r\n]{1,128}$")
     _TABLE_NAME = "gold_bot_trusted_devices"
+
+    _REQUIRED_COLUMNS = {
+        "source_id",
+        "encrypted_secret",
+        "is_active",
+        "created_at",
+        "updated_at",
+        "revoked_at",
+    }
 
     def __init__(
         self,
@@ -89,38 +97,119 @@ class DeviceRegistry:
     def _initialize_sync(self) -> None:
         try:
             with self._connect() as connection:
-                connection.execute(
+                rows = connection.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_trusted_devices (
-                        source_id VARCHAR(128) PRIMARY KEY,
-                        encrypted_secret TEXT NOT NULL,
-                        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                        created_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-                        revoked_at TIMESTAMPTZ NULL
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_columns = {
+                    row[0] for row in rows
+                }
+
+                problems = []
+
+                if not actual_columns:
+                    problems.append(
+                        f"Missing table: {self._TABLE_NAME}"
                     )
+                else:
+                    missing = (
+                        self._REQUIRED_COLUMNS
+                        - actual_columns
+                    )
+
+                    if missing:
+                        problems.append(
+                            "Missing trusted-device columns: "
+                            + ", ".join(sorted(missing))
+                        )
+
+                constraints = connection.execute(
                     """
+                    SELECT conname, contype
+                    FROM pg_constraint
+                    WHERE conrelid = to_regclass(%s)
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_constraints = {
+                    name: constraint_type
+                    for name, constraint_type in constraints
+                }
+
+                if actual_constraints.get(
+                    "gold_bot_trusted_devices_pkey"
+                ) != "p":
+                    problems.append(
+                        "Missing trusted-device primary key"
+                    )
+
+                indexes = connection.execute(
+                    """
+                    SELECT
+                        idx.relname,
+                        i.indisvalid,
+                        i.indisready
+                    FROM pg_index i
+                    JOIN pg_class idx
+                      ON idx.oid = i.indexrelid
+                    JOIN pg_class tbl
+                      ON tbl.oid = i.indrelid
+                    JOIN pg_namespace ns
+                      ON ns.oid = tbl.relnamespace
+                    WHERE ns.nspname = current_schema()
+                      AND tbl.relname = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_indexes = {
+                    name: (is_valid, is_ready)
+                    for name, is_valid, is_ready in indexes
+                }
+
+                index_state = actual_indexes.get(
+                    "idx_trusted_devices_active"
                 )
 
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_trusted_devices_active
-                    ON gold_bot_trusted_devices (is_active)
-                    """
-                )
+                if index_state is None:
+                    problems.append(
+                        "Missing trusted-device active index"
+                    )
+                elif not all(index_state):
+                    problems.append(
+                        "Invalid trusted-device active index"
+                    )
 
+                if problems:
+                    raise DeviceRegistryError(
+                        "Database schema is not migrated correctly. "
+                        "Run alembic upgrade head. Details: "
+                        + "; ".join(problems)
+                    )
+
+        except DeviceRegistryError:
+            raise
         except Exception as exc:
             raise DeviceRegistryError(
                 "Unable to initialize trusted device registry"
             ) from exc
 
     async def initialize(self) -> None:
-        """Create the trusted-device table and indexes."""
-        await asyncio.to_thread(self._initialize_sync)
+        """
+        Verify the Alembic-managed trusted-device schema.
+
+        This method never creates or alters database objects.
+        """
+        await asyncio.to_thread(
+            self._initialize_sync
+        )
 
     def _register_device_sync(
         self,
@@ -163,9 +252,6 @@ class DeviceRegistry:
 
         The encrypted secret is authenticated before storage.
         Returns False if the source_id already exists.
-
-        This method must only be called by trusted enrollment
-        code, never directly from a public endpoint.
         """
         normalized_source_id = self._validate_source_id(
             source_id
