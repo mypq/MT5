@@ -1,11 +1,27 @@
 
 import asyncio
-import logging
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from app.core.device_secret_crypto import DeviceSecretCipher
+
+
+class FakeCipher(DeviceSecretCipher):
+    def __init__(self, key):
+        # Test double: preserves the required DeviceSecretCipher type.
+        pass
+
+
+def fake_secret(value):
+    return type(
+        "Secret",
+        (),
+        {
+            "get_secret_value": lambda self: value,
+        },
+    )()
 
 
 def test_lifespan_disabled_mode_sets_database_disabled():
@@ -55,21 +71,69 @@ def test_health_endpoint_reports_disabled_ingestion(monkeypatch):
     assert payload["shutting_down"] is False
 
 
-def test_health_endpoint_reports_unhealthy_database_when_ingestion_enabled(
+def test_health_endpoint_reports_unhealthy_database_when_not_connected(
     monkeypatch,
 ):
+    calls = []
+
+    class FakeStore:
+        def __init__(self, *args, **kwargs):
+            calls.append(("construct", self.__class__.__name__))
+
+        async def initialize(self):
+            calls.append(("initialize", self.__class__.__name__))
+
+    class FakeNonceStore(FakeStore):
+        pass
+
+    class FakeDeviceRegistry(FakeStore):
+        pass
+
+    class FakeMarketDataStore(FakeStore):
+        pass
+
+    class FakeMarketTimeStore(FakeStore):
+        pass
+
+    async def fake_cleanup(store):
+        await asyncio.Future()
+
     monkeypatch.setattr(
         main.settings,
         "MARKET_DATA_INGESTION_ENABLED",
         True,
     )
+    monkeypatch.setattr(
+        main.settings,
+        "DATABASE_URL",
+        fake_secret("postgresql://test"),
+    )
+    monkeypatch.setattr(
+        main.settings,
+        "DEVICE_SECRET_ENCRYPTION_KEY",
+        fake_secret("ab" * 32),
+    )
+
+    monkeypatch.setattr(main, "DeviceSecretCipher", FakeCipher)
+    monkeypatch.setattr(main, "PostgresNonceStore", FakeNonceStore)
+    monkeypatch.setattr(main, "DeviceRegistry", FakeDeviceRegistry)
+    monkeypatch.setattr(main, "MarketDataStore", FakeMarketDataStore)
+    monkeypatch.setattr(main, "MarketTimeStore", FakeMarketTimeStore)
+    monkeypatch.setattr(main, "run_nonce_cleanup", fake_cleanup)
 
     with TestClient(main.app) as client:
+        # Startup succeeds with isolated fake stores.
+        # This test specifically verifies the unhealthy health response.
+        main.app.state.database_status = "NOT_CONNECTED"
+
         response = client.get("/health")
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "unhealthy"
-    assert response.json()["database_status"] == "NOT_CONNECTED"
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["status"] == "unhealthy"
+        assert payload["database_status"] == "NOT_CONNECTED"
+        assert payload["market_data_ingestion_enabled"] is True
 
 
 def test_system_status_reports_demo_only_safety():
@@ -116,10 +180,6 @@ def test_lifespan_initializes_all_stores_when_ingestion_enabled(
         async def initialize(self):
             calls.append(("initialize", self.__class__.__name__))
 
-    class FakeCipher:
-        def __init__(self, key):
-            calls.append(("cipher", key))
-
     class FakeNonceStore(FakeStore):
         pass
 
@@ -143,12 +203,12 @@ def test_lifespan_initializes_all_stores_when_ingestion_enabled(
     monkeypatch.setattr(
         main.settings,
         "DATABASE_URL",
-        type("Secret", (), {"get_secret_value": lambda self: "postgresql://test"})(),
+        fake_secret("postgresql://test"),
     )
     monkeypatch.setattr(
         main.settings,
         "DEVICE_SECRET_ENCRYPTION_KEY",
-        type("Secret", (), {"get_secret_value": lambda self: "test-key"})(),
+        fake_secret("ab" * 32),
     )
 
     monkeypatch.setattr(main, "DeviceSecretCipher", FakeCipher)
@@ -216,10 +276,6 @@ def test_lifespan_stops_cleanup_task_on_shutdown(monkeypatch):
         async def initialize(self):
             pass
 
-    class FakeCipher:
-        def __init__(self, key):
-            pass
-
     monkeypatch.setattr(
         main.settings,
         "MARKET_DATA_INGESTION_ENABLED",
@@ -228,12 +284,12 @@ def test_lifespan_stops_cleanup_task_on_shutdown(monkeypatch):
     monkeypatch.setattr(
         main.settings,
         "DATABASE_URL",
-        type("Secret", (), {"get_secret_value": lambda self: "postgresql://test"})(),
+        fake_secret("postgresql://test"),
     )
     monkeypatch.setattr(
         main.settings,
         "DEVICE_SECRET_ENCRYPTION_KEY",
-        type("Secret", (), {"get_secret_value": lambda self: "test-key"})(),
+        fake_secret("ab" * 32),
     )
 
     monkeypatch.setattr(main, "DeviceSecretCipher", FakeCipher)
@@ -244,7 +300,10 @@ def test_lifespan_stops_cleanup_task_on_shutdown(monkeypatch):
     monkeypatch.setattr(main, "run_nonce_cleanup", fake_cleanup)
 
     with TestClient(main.app):
-        assert started.is_set() or main.app.state.nonce_cleanup_task is not None
+        assert (
+            started.is_set()
+            or main.app.state.nonce_cleanup_task is not None
+        )
 
     assert cancelled.is_set()
     assert main.app.state.nonce_cleanup_task is None
@@ -261,10 +320,6 @@ def test_lifespan_initialization_failure_sets_error_and_reraises(
         async def initialize(self):
             raise RuntimeError("database initialization failed")
 
-    class FakeCipher:
-        def __init__(self, key):
-            pass
-
     monkeypatch.setattr(
         main.settings,
         "MARKET_DATA_INGESTION_ENABLED",
@@ -273,12 +328,12 @@ def test_lifespan_initialization_failure_sets_error_and_reraises(
     monkeypatch.setattr(
         main.settings,
         "DATABASE_URL",
-        type("Secret", (), {"get_secret_value": lambda self: "postgresql://test"})(),
+        fake_secret("postgresql://test"),
     )
     monkeypatch.setattr(
         main.settings,
         "DEVICE_SECRET_ENCRYPTION_KEY",
-        type("Secret", (), {"get_secret_value": lambda self: "test-key"})(),
+        fake_secret("ab" * 32),
     )
 
     monkeypatch.setattr(main, "DeviceSecretCipher", FakeCipher)
@@ -317,20 +372,16 @@ def test_unexpected_exception_handler_hides_internal_details():
 
 
 def test_market_data_router_is_registered():
-    paths = {
-        route.path
-        for route in main.app.routes
-        if hasattr(route, "path")
-    }
+    paths = set(main.app.openapi()["paths"])
 
-    assert "/health" in paths
     assert "/" in paths
+    assert "/health" in paths
     assert "/api/v1/system/status" in paths
-    assert any(
-        path.startswith("/api/")
-        and "market-data" in path
-        for path in paths
-    )
+
+    assert "/api/v1/market-data/candles" in paths
+    assert "/api/v1/market-data/candles/v2" in paths
+    assert "/api/v1/market-data/account" in paths
+    assert "/api/v1/market-data/positions" in paths
 
 
 def test_lifespan_marks_shutdown_even_when_ingestion_is_disabled():
