@@ -1,4 +1,3 @@
-
 import asyncio
 import re
 from datetime import datetime, timezone
@@ -311,6 +310,41 @@ class MarketTimeStore:
                         source_id,
                         effective_from_utc
                     )
+                    """
+                )
+
+                # إضافة قيد الاستبعاد لمنع التداخلات الزمنية (Exclusion Constraint)
+                connection.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conname =
+                                'ex_time_offset_v2_no_overlap'
+                              AND conrelid =
+                                'gold_bot_time_offset_history_v2'
+                                ::regclass
+                        ) THEN
+                            ALTER TABLE
+                                gold_bot_time_offset_history_v2
+                            ADD CONSTRAINT
+                                ex_time_offset_v2_no_overlap
+                            EXCLUDE USING gist (
+                                source_id WITH =,
+                                tstzrange(
+                                    effective_from_utc,
+                                    effective_to_utc,
+                                    '[)'
+                                ) WITH &&
+                            )
+                            WHERE (
+                                validation_status <> 'REJECTED'
+                            );
+                        END IF;
+                    END
+                    $$
                     """
                 )
 
