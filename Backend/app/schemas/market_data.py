@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
@@ -35,6 +36,17 @@ class AccountMode(str, Enum):
 class PositionSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
+
+
+class MeasurementStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class PositionTimeStatus(str, Enum):
+    VERIFIED = "VERIFIED"
+    UNVERIFIED = "UNVERIFIED"
 
 
 class VolumeSource(str, Enum):
@@ -211,12 +223,26 @@ class AccountSnapshot(StrictModel):
     balance: float = Field(ge=0)
     equity: float = Field(ge=0)
 
-    daily_start_equity: float = Field(gt=0)
+    daily_start_equity: float | None = Field(
+        default=None,
+        gt=0,
+    )
+
+    daily_start_equity_status: MeasurementStatus = (
+        MeasurementStatus.UNAVAILABLE
+    )
 
     free_margin: float = Field(ge=0)
     used_margin: float = Field(ge=0)
 
-    daily_realized_loss: float = Field(ge=0)
+    daily_realized_loss: float | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    daily_realized_loss_status: MeasurementStatus = (
+        MeasurementStatus.UNAVAILABLE
+    )
 
     positions_count: int = Field(ge=0, le=1000)
 
@@ -262,6 +288,36 @@ class AccountSnapshot(StrictModel):
 
         return normalized
 
+    @model_validator(mode="after")
+    def validate_daily_metrics(self):
+        metrics = (
+            (
+                "daily_start_equity",
+                self.daily_start_equity,
+                self.daily_start_equity_status,
+            ),
+            (
+                "daily_realized_loss",
+                self.daily_realized_loss,
+                self.daily_realized_loss_status,
+            ),
+        )
+
+        for name, value, status in metrics:
+            if status == MeasurementStatus.AVAILABLE:
+                if value is None:
+                    raise ValueError(
+                        f"{name} requires a value when AVAILABLE"
+                    )
+
+            elif status == MeasurementStatus.UNAVAILABLE:
+                if value is not None:
+                    raise ValueError(
+                        f"{name} must be null when UNAVAILABLE"
+                    )
+
+        return self
+
 
 class OpenPosition(StrictModel):
     position_id: str = Field(
@@ -290,14 +346,53 @@ class OpenPosition(StrictModel):
 
     floating_profit: float
 
-    opened_at: datetime
+    opened_at_broker_local: datetime
 
-    @field_validator("opened_at")
+    opened_at_utc: datetime | None = None
+
+    time_resolution_status: PositionTimeStatus = (
+        PositionTimeStatus.UNVERIFIED
+    )
+
+    @field_validator(
+        "opened_at_broker_local",
+        mode="before",
+    )
     @classmethod
-    def validate_opened_at(
+    def require_broker_local_time_format(cls, value):
+        if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+            value,
+        ):
+            raise ValueError(
+                "opened_at_broker_local must use "
+                "YYYY-MM-DDTHH:MM:SS without timezone"
+            )
+
+        return value
+
+    @field_validator("opened_at_broker_local")
+    @classmethod
+    def validate_broker_local_open_time(
         cls,
         value: datetime,
     ) -> datetime:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError(
+                "opened_at_broker_local must be timezone-naive"
+            )
+
+        return value.replace(tzinfo=None)
+
+    @field_validator("opened_at_utc")
+    @classmethod
+    def validate_opened_at_utc(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is None:
+            return None
+
         return require_aware_datetime(value)
 
     @field_validator("position_id")
@@ -314,6 +409,21 @@ class OpenPosition(StrictModel):
             )
 
         return normalized
+
+    @model_validator(mode="after")
+    def validate_position_time_resolution(self):
+        if self.time_resolution_status == PositionTimeStatus.VERIFIED:
+            if self.opened_at_utc is None:
+                raise ValueError(
+                    "VERIFIED position time requires opened_at_utc"
+                )
+
+        elif self.opened_at_utc is not None:
+            raise ValueError(
+                "opened_at_utc is only allowed for VERIFIED position time"
+            )
+
+        return self
 
 
 class OpenPositionsSnapshot(StrictModel):
@@ -359,9 +469,12 @@ class OpenPositionsSnapshot(StrictModel):
             )
 
         for position in self.positions:
-            if position.opened_at > self.sent_at:
+            if (
+                position.opened_at_utc is not None
+                and position.opened_at_utc > self.sent_at
+            ):
                 raise ValueError(
-                    "Position opened_at cannot be after snapshot sent_at"
+                    "Position opened_at_utc cannot be after snapshot sent_at"
                 )
 
         return self
