@@ -365,6 +365,77 @@ class OpenPositionsSnapshot(StrictModel):
                 )
 
         return self
+
+
+class BrokerTimeMetadataV2(StrictModel):
+    """Broker clock metadata; it never proves historical UTC mapping."""
+
+    time_source: Literal["MT5_SERVER_TIME"] = "MT5_SERVER_TIME"
+
+    broker_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
+    server_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
+    timezone_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+    )
+
+    reported_utc_offset_minutes: int | None = Field(
+        default=None,
+        ge=-720,
+        le=840,
+    )
+
+    @field_validator(
+        "broker_name",
+        "server_name",
+        "timezone_name",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value):
+        if value is None:
+            return None
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError(
+                "Broker time metadata cannot be blank"
+            )
+
+        return normalized
+
+    @field_validator("timezone_name")
+    @classmethod
+    def validate_timezone_name(cls, value):
+        if value is None:
+            return None
+
+        if (
+            value.startswith("/")
+            or ".." in value
+            or not re.fullmatch(
+                r"[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*",
+                value,
+            )
+        ):
+            raise ValueError(
+                "Invalid timezone identifier format"
+            )
+
+        return value
+
+
 class MarketCandleV2(StrictModel):
     broker_local_time: datetime
 
@@ -379,21 +450,33 @@ class MarketCandleV2(StrictModel):
 
     is_closed: Literal[True]
 
-    @field_validator("broker_local_time")
+    @field_validator(
+        "broker_local_time",
+        mode="before",
+    )
     @classmethod
-    def validate_broker_local_time(
-        cls,
-        value: datetime,
-    ) -> datetime:
-        if (
-            value.tzinfo is not None
-            and value.utcoffset() is not None
+    def require_exact_broker_time_format(cls, value):
+        if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+            value,
         ):
             raise ValueError(
-                "Broker-local time must not contain timezone data"
+                "broker_local_time must use "
+                "YYYY-MM-DDTHH:MM:SS "
+                "without timezone or UTC suffix"
             )
 
         return value
+
+    @field_validator("broker_local_time")
+    @classmethod
+    def validate_broker_local_time(cls, value):
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError(
+                "broker_local_time must be timezone-naive"
+            )
+
+        return value.replace(tzinfo=None)
 
     @model_validator(mode="after")
     def validate_ohlc(self):
@@ -431,6 +514,8 @@ class MarketDataBatchV2(StrictModel):
 
     volume_source: VolumeSource = VolumeSource.UNKNOWN
 
+    broker_time: BrokerTimeMetadataV2 | None = None
+
     candles: list[MarketCandleV2] = Field(
         min_length=2,
         max_length=2000,
@@ -461,12 +546,14 @@ class MarketDataBatchV2(StrictModel):
 
         if timestamps != sorted(timestamps):
             raise ValueError(
-                "Candles must be ordered chronologically"
+                "Broker candle times must be ordered chronologically"
             )
 
         if len(timestamps) != len(set(timestamps)):
             raise ValueError(
-                "Duplicate broker-local candle timestamps are not allowed"
+                "Duplicate broker candle times are not allowed"
             )
 
+        # Broker wall-clock time is never compared with UTC sent_at.
+        # Historical UTC conversion requires verified time history.
         return self
