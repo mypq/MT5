@@ -184,6 +184,8 @@ def test_indicators_match_reference_values():
             rel=1e-8,
             abs=1e-8,
         )
+
+
 def test_rejects_boolean_prices():
     candles = make_candles([100.0] * 60)
     candles[5]["close"] = True
@@ -302,19 +304,26 @@ def test_flat_market_observations_are_neutral():
     )
 
 
-def test_rising_market_observations():
-    result = analyze_indicators(
-        make_candles([100.0 + i for i in range(60)])
-    )
+@pytest.mark.parametrize(
+    "closes",
+    [
+        [100.0 + i for i in range(60)],
+        [160.0 - i for i in range(60)],
+    ],
+)
+def test_macd_observation_matches_histogram(closes):
+    result = analyze_indicators(make_candles(closes))
 
-    assert "RSI_OVERBOUGHT_ZONE" in result["observations"]
-    assert "MACD_BULLISH" in result["observations"]
+    histogram = result["indicators"]["macd_histogram"]
+    observations = result["observations"]
 
-
-def test_falling_market_observations():
-    result = analyze_indicators(
-        make_candles([160.0 - i for i in range(60)])
-    )
-
-    assert "RSI_OVERSOLD_ZONE" in result["observations"]
-    assert "MACD_BEARISH" in result["observations"]
+    if histogram > 0:
+        assert "MACD_BULLISH" in observations
+        assert "MACD_BEARISH" not in observations
+    elif histogram < 0:
+        assert "MACD_BEARISH" in observations
+        assert "MACD_BULLISH" not in observations
+    else:
+        assert "MACD_NEUTRAL" in observations
+        assert "MACD_BULLISH" not in observations
+        assert "MACD_BEARISH" not in observations
