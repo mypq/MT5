@@ -1,6 +1,6 @@
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
@@ -548,4 +548,91 @@ class MarketTimeStore:
             utc_offset_minutes=utc_offset_minutes,
             evidence_reference=evidence_reference,
             is_dst=is_dst,
+        )
+
+    def _resolve_broker_local_time_sync(
+        self,
+        *,
+        source_id: str,
+        broker_local_time: datetime,
+    ) -> datetime | None:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        effective_from_utc,
+                        effective_to_utc,
+                        utc_offset_minutes
+                    FROM gold_bot_time_offset_history_v2
+                    WHERE source_id = %s
+                      AND validation_status = 'VERIFIED'
+                    ORDER BY effective_from_utc
+                    """,
+                    (source_id,),
+                ).fetchall()
+
+            matches = []
+
+            for start_utc, end_utc, offset_minutes in rows:
+                candidate_utc = (
+                    broker_local_time.replace(
+                        tzinfo=timezone.utc
+                    )
+                    - timedelta(minutes=offset_minutes)
+                )
+
+                if (
+                    candidate_utc >= start_utc
+                    and (
+                        end_utc is None
+                        or candidate_utc < end_utc
+                    )
+                ):
+                    matches.append(candidate_utc)
+
+            if len(matches) != 1:
+                return None
+
+            return matches[0]
+
+        except Exception as exc:
+            raise MarketTimeStoreError(
+                "Unable to resolve broker-local timestamp"
+            ) from exc
+
+    async def resolve_broker_local_time(
+        self,
+        *,
+        source_id: str,
+        broker_local_time: datetime,
+    ) -> datetime | None:
+        """
+        Resolve broker-local wall time using verified UTC periods only.
+
+        Returns UTC datetime only when exactly one verified period
+        matches. Returns None for missing or ambiguous history.
+
+        Naive datetime is required because broker-local time has
+        no timezone information attached to it.
+        """
+        source_id = self._validate_source_id(source_id)
+
+        if not isinstance(broker_local_time, datetime):
+            raise MarketTimeStoreError(
+                "Broker-local time must be a datetime"
+            )
+
+        if (
+            broker_local_time.tzinfo is not None
+            and broker_local_time.utcoffset() is not None
+        ):
+            raise MarketTimeStoreError(
+                "Broker-local time must not contain timezone data"
+            )
+
+        return await asyncio.to_thread(
+            self._resolve_broker_local_time_sync,
+            source_id=source_id,
+            broker_local_time=broker_local_time,
         )
