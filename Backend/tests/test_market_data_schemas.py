@@ -1,3 +1,4 @@
+
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -315,7 +316,7 @@ def valid_market_batch_v2():
         "volume_source": "TICK",
         "candles": [
             {
-                "broker_local_time": datetime(2026, 1, 1, 10, 0),
+                "broker_local_time": "2026-01-01T10:00:00",
                 "open": 2650.0,
                 "high": 2660.0,
                 "low": 2640.0,
@@ -326,7 +327,7 @@ def valid_market_batch_v2():
                 "is_closed": True,
             },
             {
-                "broker_local_time": datetime(2026, 1, 1, 10, 1),
+                "broker_local_time": "2026-01-01T10:01:00",
                 "open": 2655.0,
                 "high": 2665.0,
                 "low": 2650.0,
@@ -356,12 +357,12 @@ def test_market_batch_v2_rejects_timezone_aware_candle_time():
     payload = valid_market_batch_v2()
 
     payload["candles"][0]["broker_local_time"] = (
-        datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+        "2026-01-01T10:00:00Z"
     )
 
     with pytest.raises(
         ValidationError,
-        match="must not contain timezone data",
+        match="without timezone or UTC suffix",
     ):
         MarketDataBatchV2.model_validate(payload)
 
@@ -375,7 +376,7 @@ def test_market_batch_v2_rejects_duplicate_local_times():
 
     with pytest.raises(
         ValidationError,
-        match="Duplicate broker-local",
+        match="Duplicate broker candle times",
     ):
         MarketDataBatchV2.model_validate(payload)
 
