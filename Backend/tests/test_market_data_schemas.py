@@ -1,3 +1,4 @@
+
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -26,39 +27,6 @@ def valid_candle(open_time: datetime) -> dict:
         "open_time": open_time,
         "open": 2650.0,
         "high": 2660.0,
-        def test_market_batch_rejects_naive_sent_at():
-    payload = valid_market_batch()
-    payload["sent_at"] = datetime.now()
-
-    with pytest.raises(
-        ValidationError,
-        match="timezone",
-    ):
-        MarketDataBatch.model_validate(payload)
-
-
-def test_market_batch_rejects_candle_with_naive_open_time():
-    payload = valid_market_batch()
-    payload["candles"][0]["open_time"] = datetime.now()
-
-    with pytest.raises(
-        ValidationError,
-        match="timezone",
-    ):
-        MarketDataBatch.model_validate(payload)
-
-
-def test_market_batch_rejects_candle_starting_after_sent_at():
-    payload = valid_market_batch()
-    payload["candles"][-1]["open_time"] = (
-        payload["sent_at"] + timedelta(seconds=1)
-    )
-
-    with pytest.raises(
-        ValidationError,
-        match="Latest candle cannot start after sent_at",
-    ):
-        MarketDataBatch.model_validate(payload)
         "low": 2640.0,
         "close": 2655.0,
         "tick_volume": 120,
@@ -295,4 +263,39 @@ def test_market_batch_rejects_unknown_volume_source():
     payload["volume_source"] = "BROKER_GUESS"
 
     with pytest.raises(ValidationError):
+        MarketDataBatch.model_validate(payload)
+
+
+def test_market_batch_rejects_naive_sent_at():
+    payload = valid_market_batch()
+    payload["sent_at"] = datetime.now()
+
+    with pytest.raises(
+        ValidationError,
+        match="timezone",
+    ):
+        MarketDataBatch.model_validate(payload)
+
+
+def test_market_batch_rejects_candle_with_naive_open_time():
+    payload = valid_market_batch()
+    payload["candles"][0]["open_time"] = datetime.now()
+
+    with pytest.raises(
+        ValidationError,
+        match="timezone",
+    ):
+        MarketDataBatch.model_validate(payload)
+
+
+def test_market_batch_rejects_candle_starting_after_sent_at():
+    payload = valid_market_batch()
+    payload["candles"][-1]["open_time"] = (
+        payload["sent_at"] + timedelta(seconds=1)
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="Latest candle cannot start after sent_at",
+    ):
         MarketDataBatch.model_validate(payload)
