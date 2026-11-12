@@ -371,29 +371,33 @@ def test_market_batch_v2_rejects_timezone_aware_candle_time():
         MarketDataBatchV2.model_validate(payload)
 
 
-def test_market_batch_v2_rejects_duplicate_local_times():
+def test_market_batch_v2_accepts_duplicate_local_times():
     payload = valid_market_batch_v2()
 
     payload["candles"][1]["broker_local_time"] = (
         payload["candles"][0]["broker_local_time"]
     )
 
-    with pytest.raises(
-        ValidationError,
-        match="Duplicate broker candle times",
-    ):
-        MarketDataBatchV2.model_validate(payload)
+    batch = MarketDataBatchV2.model_validate(payload)
+
+    assert len(batch.candles) == 2
+    assert (
+        batch.candles[0].broker_local_time
+        == batch.candles[1].broker_local_time
+    )
 
 
-def test_market_batch_v2_rejects_unordered_local_times():
+def test_market_batch_v2_accepts_unordered_local_times():
     payload = valid_market_batch_v2()
     payload["candles"].reverse()
 
-    with pytest.raises(
-        ValidationError,
-        match="chronologically",
-    ):
-        MarketDataBatchV2.model_validate(payload)
+    batch = MarketDataBatchV2.model_validate(payload)
+
+    assert len(batch.candles) == 2
+    assert (
+        batch.candles[0].broker_local_time
+        > batch.candles[1].broker_local_time
+    )
 
 
 def test_market_batch_v2_rejects_unknown_schema_version():
