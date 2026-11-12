@@ -461,3 +461,45 @@ def test_postgres_database_rejects_invalid_period_and_offset(
                         "Invalid UTC offset",
                     ),
                 )
+def test_postgres_prevents_deleting_device_with_time_history(
+    postgres_store,
+):
+    _, source_id = postgres_store
+
+    start = datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """
+            INSERT INTO gold_bot_time_offset_history_v2 (
+                source_id,
+                effective_from_utc,
+                effective_to_utc,
+                utc_offset_minutes,
+                evidence_reference
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                source_id,
+                start,
+                start + timedelta(days=30),
+                180,
+                "Device deletion protection test",
+            ),
+        )
+
+        with pytest.raises(
+            psycopg.errors.ForeignKeyViolation
+        ):
+            with connection.transaction():
+                connection.execute(
+                    """
+                    DELETE FROM gold_bot_device_time_config
+                    WHERE source_id = %s
+                    """,
+                    (source_id,),
+                )
