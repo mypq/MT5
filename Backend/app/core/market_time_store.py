@@ -371,7 +371,7 @@ class MarketTimeStore:
     ) -> None:
         try:
             with self._connect() as connection:
-                connection.execute(
+                updated = connection.execute(
                     """
                     INSERT INTO gold_bot_device_time_config (
                         source_id,
@@ -387,7 +387,6 @@ class MarketTimeStore:
                         'UNVERIFIED',
                         CURRENT_TIMESTAMP
                     )
-
                     ON CONFLICT (source_id)
                     DO UPDATE SET
                         broker_name = EXCLUDED.broker_name,
@@ -397,6 +396,18 @@ class MarketTimeStore:
                             EXCLUDED.reported_utc_offset_minutes,
                         config_status = 'UNVERIFIED',
                         updated_at = CURRENT_TIMESTAMP
+                    WHERE (
+                        gold_bot_device_time_config.broker_name,
+                        gold_bot_device_time_config.server_name,
+                        gold_bot_device_time_config.timezone_name,
+                        gold_bot_device_time_config.reported_utc_offset_minutes
+                    ) IS DISTINCT FROM (
+                        EXCLUDED.broker_name,
+                        EXCLUDED.server_name,
+                        EXCLUDED.timezone_name,
+                        EXCLUDED.reported_utc_offset_minutes
+                    )
+                    RETURNING source_id
                     """,
                     (
                         source_id,
@@ -405,7 +416,18 @@ class MarketTimeStore:
                         timezone_name,
                         reported_utc_offset_minutes,
                     ),
-                )
+                ).fetchone()
+
+                if updated is not None:
+                    connection.execute(
+                        """
+                        UPDATE gold_bot_time_offset_history_v2
+                        SET validation_status = 'UNVERIFIED'
+                        WHERE source_id = %s
+                          AND validation_status = 'VERIFIED'
+                        """,
+                        (source_id,),
+                    )
 
         except Exception as exc:
             raise MarketTimeStoreError(
