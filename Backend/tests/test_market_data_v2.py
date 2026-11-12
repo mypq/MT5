@@ -86,28 +86,32 @@ def test_v2_rejects_invalid_calendar_date():
         MarketDataBatchV2.model_validate(payload)
 
 
-def test_v2_rejects_duplicate_broker_times():
+def test_v2_accepts_duplicate_broker_times():
     payload = valid_batch()
     payload["candles"][1]["broker_local_time"] = (
         payload["candles"][0]["broker_local_time"]
     )
 
-    with pytest.raises(
-        ValidationError,
-        match="Duplicate broker candle times",
-    ):
-        MarketDataBatchV2.model_validate(payload)
+    batch = MarketDataBatchV2.model_validate(payload)
+
+    assert len(batch.candles) == 2
+    assert (
+        batch.candles[0].broker_local_time
+        == batch.candles[1].broker_local_time
+    )
 
 
-def test_v2_rejects_unordered_broker_times():
+def test_v2_accepts_unordered_broker_times():
     payload = valid_batch()
     payload["candles"].reverse()
 
-    with pytest.raises(
-        ValidationError,
-        match="chronologically",
-    ):
-        MarketDataBatchV2.model_validate(payload)
+    batch = MarketDataBatchV2.model_validate(payload)
+
+    assert len(batch.candles) == 2
+    assert (
+        batch.candles[0].broker_local_time
+        > batch.candles[1].broker_local_time
+    )
 
 
 def test_v2_rejects_invalid_ohlc():
