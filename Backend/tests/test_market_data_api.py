@@ -1,4 +1,3 @@
-
 import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -641,6 +640,7 @@ async def test_v2_time_resolution_failure_returns_503(
     )
     assert data_store.saved_messages == []
 
+
 def test_v2_payload_matches_mt5_connector_contract():
     payload = build_valid_candles_v2_payload()
 
@@ -719,6 +719,8 @@ def test_v2_rejects_unsupported_extra_candle_fields():
         market_data.MarketDataBatchV2.model_validate(
             payload
         )
+
+
 @pytest.mark.asyncio
 async def test_account_snapshot_is_received_and_stored(monkeypatch):
     patch_runtime_types(monkeypatch)
@@ -732,10 +734,12 @@ async def test_account_snapshot_is_received_and_stored(monkeypatch):
         "account_currency": "USD",
         "balance": 10000.0,
         "equity": 9950.0,
-        "daily_start_equity": 10000.0,
+        "daily_start_equity": None,
+        "daily_start_equity_status": "UNAVAILABLE",
         "free_margin": 9000.0,
         "used_margin": 1000.0,
-        "daily_realized_loss": 50.0,
+        "daily_realized_loss": None,
+        "daily_realized_loss_status": "UNAVAILABLE",
         "positions_count": 1,
         "sent_at": sent_at.isoformat(),
     }
@@ -776,7 +780,6 @@ async def test_positions_snapshot_is_received_and_stored(monkeypatch):
     patch_runtime_types(monkeypatch)
 
     sent_at = datetime.now(timezone.utc)
-    opened_at = sent_at - timedelta(minutes=5)
 
     payload = {
         "message_id": str(uuid4()),
@@ -793,7 +796,9 @@ async def test_positions_snapshot_is_received_and_stored(monkeypatch):
                 "stop_loss": 2640.0,
                 "take_profit": 2670.0,
                 "floating_profit": 5.0,
-                "opened_at": opened_at.isoformat(),
+                "opened_at_broker_local": "2026-11-12T09:00:00",
+                "opened_at_utc": None,
+                "time_resolution_status": "UNVERIFIED",
             }
         ],
     }
@@ -828,6 +833,7 @@ async def test_positions_snapshot_is_received_and_stored(monkeypatch):
     assert len(saved["payload"]["positions"]) == 1
     assert saved["payload"]["positions"][0]["position_id"] == "123456"
 
+
 def build_valid_account_payload():
     now = datetime.now(timezone.utc)
 
@@ -838,10 +844,12 @@ def build_valid_account_payload():
         "account_currency": "USD",
         "balance": 10000.0,
         "equity": 9950.0,
-        "daily_start_equity": 10000.0,
+        "daily_start_equity": None,
+        "daily_start_equity_status": "UNAVAILABLE",
         "free_margin": 9000.0,
         "used_margin": 1000.0,
-        "daily_realized_loss": 50.0,
+        "daily_realized_loss": None,
+        "daily_realized_loss_status": "UNAVAILABLE",
         "positions_count": 1,
         "sent_at": now.isoformat(),
     }
@@ -865,9 +873,9 @@ def build_valid_positions_payload():
                 "stop_loss": 2640.0,
                 "take_profit": 2670.0,
                 "floating_profit": 5.0,
-                "opened_at": (
-                    now - timedelta(minutes=5)
-                ).isoformat(),
+                "opened_at_broker_local": "2026-11-12T09:00:00",
+                "opened_at_utc": None,
+                "time_resolution_status": "UNVERIFIED",
             }
         ],
     }
