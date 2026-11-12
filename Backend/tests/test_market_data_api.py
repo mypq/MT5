@@ -477,7 +477,7 @@ async def test_storage_failure_returns_503(
 
 
 @pytest.mark.asyncio
-async def test_v2_verified_candles_are_stored_with_utc_times(
+async def test_v2_unverified_candles_are_stored_as_raw(
     monkeypatch,
 ):
     patch_runtime_types(monkeypatch)
@@ -485,21 +485,12 @@ async def test_v2_verified_candles_are_stored_with_utc_times(
     payload = build_valid_candles_v2_payload()
     raw_body = json.dumps(payload).encode("utf-8")
 
-    first_utc = datetime(
-        2026, 11, 12, 7, 0, tzinfo=timezone.utc
-    )
-    second_utc = datetime(
-        2026, 11, 12, 7, 1, tzinfo=timezone.utc
-    )
-
-    time_store = FakeMarketTimeStore(
-        results=[first_utc, second_utc]
-    )
     data_store = FakeMarketDataStore()
 
+    # V2 must not depend on MarketTimeStore.
     request = build_request(
         market_data_store=data_store,
-        market_time_store=time_store,
+        market_time_store=object(),
     )
 
     async def fake_authentication(**kwargs):
@@ -521,23 +512,28 @@ async def test_v2_verified_candles_are_stored_with_utc_times(
     saved_payload = saved["payload"]
 
     assert saved["raw_body"] == raw_body
-    assert saved_payload["time_resolution_status"] == "VERIFIED"
+    assert saved_payload["schema_version"] == 2
+    assert "time_resolution_status" not in saved_payload
 
-    assert (
-        saved_payload["candles"][0]["open_time_utc"]
-        == first_utc.isoformat()
-    )
+    for index, original_candle in enumerate(payload["candles"]):
+        stored_candle = saved_payload["candles"][index]
 
-    assert (
-        saved_payload["candles"][1]["open_time_utc"]
-        == second_utc.isoformat()
-    )
+        assert (
+            stored_candle["broker_local_time"]
+            == original_candle["broker_local_time"]
+        )
+        assert "open_time_utc" not in stored_candle
 
-    assert len(time_store.calls) == 2
+    assert saved_payload["candles"] == [
+        {
+            **candle,
+        }
+        for candle in saved_payload["candles"]
+    ]
 
 
 @pytest.mark.asyncio
-async def test_v2_unverified_candle_rejects_entire_batch(
+async def test_v2_storage_does_not_call_time_resolver(
     monkeypatch,
 ):
     patch_runtime_types(monkeypatch)
@@ -545,20 +541,9 @@ async def test_v2_unverified_candle_rejects_entire_batch(
     payload = build_valid_candles_v2_payload()
     raw_body = json.dumps(payload).encode("utf-8")
 
-    time_store = FakeMarketTimeStore(
-        results=[
-            datetime(
-                2026, 11, 12, 7, 0, tzinfo=timezone.utc
-            ),
-            None,
-        ]
-    )
-
     data_store = FakeMarketDataStore()
-
     request = build_request(
         market_data_store=data_store,
-        market_time_store=time_store,
     )
 
     async def fake_authentication(**kwargs):
@@ -570,75 +555,44 @@ async def test_v2_unverified_candle_rejects_entire_batch(
         fake_authentication,
     )
 
-    with pytest.raises(HTTPException) as error:
-        await market_data.ingest_candles_v2(request)
+    result = await market_data.ingest_candles_v2(request)
 
-    assert error.value.status_code == 422
-    assert (
-        error.value.detail["error"]
-        == "BROKER_TIME_UNVERIFIED"
-    )
-    assert error.value.detail["unresolved_candle_indices"] == [1]
-    assert data_store.saved_messages == []
+    assert result["status"] == "stored"
+    assert len(data_store.saved_messages) == 1
 
 
-@pytest.mark.asyncio
-async def test_v2_missing_time_store_returns_503(
-    monkeypatch,
-):
-    patch_runtime_types(monkeypatch)
-
-    request = build_request(
-        market_time_store=object(),
-    )
-
-    with pytest.raises(HTTPException) as error:
-        await market_data.ingest_candles_v2(request)
-
-    assert error.value.status_code == 503
-    assert error.value.detail == (
-        "Market-data ingestion is unavailable"
-    )
-
-
-@pytest.mark.asyncio
-async def test_v2_time_resolution_failure_returns_503(
-    monkeypatch,
-):
-    patch_runtime_types(monkeypatch)
-
+def test_v2_accepts_duplicate_broker_local_times():
     payload = build_valid_candles_v2_payload()
-    raw_body = json.dumps(payload).encode("utf-8")
 
-    time_store = FakeMarketTimeStore(
-        error=MarketTimeStoreError("Database failure")
+    payload["candles"][1]["broker_local_time"] = (
+        payload["candles"][0]["broker_local_time"]
     )
 
-    data_store = FakeMarketDataStore()
-
-    request = build_request(
-        market_data_store=data_store,
-        market_time_store=time_store,
+    message = market_data.MarketDataBatchV2.model_validate(
+        payload
     )
 
-    async def fake_authentication(**kwargs):
-        return raw_body
-
-    monkeypatch.setattr(
-        market_data,
-        "authenticate_market_data_request",
-        fake_authentication,
-    )
-
-    with pytest.raises(HTTPException) as error:
-        await market_data.ingest_candles_v2(request)
-
-    assert error.value.status_code == 503
+    assert len(message.candles) == 2
     assert (
-        error.value.detail
-        == "Broker-time resolution is unavailable"
+        message.candles[0].broker_local_time
+        == message.candles[1].broker_local_time
     )
-    assert data_store.saved_messages == []
+
+
+def test_v2_accepts_backward_broker_local_times():
+    payload = build_valid_candles_v2_payload()
+
+    payload["candles"].reverse()
+
+    message = market_data.MarketDataBatchV2.model_validate(
+        payload
+    )
+
+    assert len(message.candles) == 2
+    assert (
+        message.candles[0].broker_local_time
+        > message.candles[1].broker_local_time
+    )
 
 
 def test_v2_payload_matches_mt5_connector_contract():
@@ -682,28 +636,6 @@ def test_v2_rejects_legacy_open_time_field():
     payload["candles"][0]["open_time"] = (
         "2026-11-12T07:00:00Z"
     )
-
-    with pytest.raises(ValueError):
-        market_data.MarketDataBatchV2.model_validate(
-            payload
-        )
-
-
-def test_v2_rejects_duplicate_broker_local_times():
-    payload = build_valid_candles_v2_payload()
-    payload["candles"][1]["broker_local_time"] = (
-        payload["candles"][0]["broker_local_time"]
-    )
-
-    with pytest.raises(ValueError):
-        market_data.MarketDataBatchV2.model_validate(
-            payload
-        )
-
-
-def test_v2_rejects_non_chronological_candles():
-    payload = build_valid_candles_v2_payload()
-    payload["candles"].reverse()
 
     with pytest.raises(ValueError):
         market_data.MarketDataBatchV2.model_validate(
