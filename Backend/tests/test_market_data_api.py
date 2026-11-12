@@ -827,3 +827,203 @@ async def test_positions_snapshot_is_received_and_stored(monkeypatch):
     assert saved["raw_body"] == raw_body
     assert len(saved["payload"]["positions"]) == 1
     assert saved["payload"]["positions"][0]["position_id"] == "123456"
+
+def build_valid_account_payload():
+    now = datetime.now(timezone.utc)
+
+    return {
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "account_mode": "DEMO",
+        "account_currency": "USD",
+        "balance": 10000.0,
+        "equity": 9950.0,
+        "daily_start_equity": 10000.0,
+        "free_margin": 9000.0,
+        "used_margin": 1000.0,
+        "daily_realized_loss": 50.0,
+        "positions_count": 1,
+        "sent_at": now.isoformat(),
+    }
+
+
+def build_valid_positions_payload():
+    now = datetime.now(timezone.utc)
+
+    return {
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "sent_at": now.isoformat(),
+        "positions": [
+            {
+                "position_id": "123456",
+                "symbol": "XAUUSD",
+                "side": "BUY",
+                "volume": 0.01,
+                "entry_price": 2650.0,
+                "current_price": 2655.0,
+                "stop_loss": 2640.0,
+                "take_profit": 2670.0,
+                "floating_profit": 5.0,
+                "opened_at": (
+                    now - timedelta(minutes=5)
+                ).isoformat(),
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,model_type,payload_builder,message_type",
+    [
+        (
+            market_data.ingest_account,
+            market_data.AccountSnapshot,
+            build_valid_account_payload,
+            "account",
+        ),
+        (
+            market_data.ingest_positions,
+            market_data.OpenPositionsSnapshot,
+            build_valid_positions_payload,
+            "positions",
+        ),
+    ],
+)
+async def test_account_and_positions_duplicate_messages(
+    monkeypatch,
+    endpoint,
+    model_type,
+    payload_builder,
+    message_type,
+):
+    patch_runtime_types(monkeypatch)
+
+    payload = payload_builder()
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    store = FakeMarketDataStore(result=False)
+    request = build_request(market_data_store=store)
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    result = await endpoint(request)
+
+    assert result["status"] == "duplicate"
+    assert result["message_type"] == message_type
+    assert len(store.saved_messages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        market_data.ingest_account,
+        market_data.ingest_positions,
+    ],
+)
+async def test_account_and_positions_authentication_failure(
+    monkeypatch,
+    endpoint,
+):
+    patch_runtime_types(monkeypatch)
+
+    request = build_request()
+
+    async def failed_authentication(**kwargs):
+        raise MarketDataAuthenticationError(
+            "Private authentication detail"
+        )
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        failed_authentication,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await endpoint(request)
+
+    assert error.value.status_code == 401
+    assert error.value.detail == (
+        "Market-data authentication failed"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        market_data.ingest_account,
+        market_data.ingest_positions,
+    ],
+)
+async def test_account_and_positions_invalid_payload(
+    monkeypatch,
+    endpoint,
+):
+    patch_runtime_types(monkeypatch)
+
+    invalid_payload = {
+        "message_id": str(uuid4()),
+        "source_id": TEST_SOURCE_ID,
+        "sent_at": "not-a-valid-timestamp",
+    }
+
+    raw_body = json.dumps(
+        invalid_payload
+    ).encode("utf-8")
+
+    request = build_request()
+
+    async def fake_authentication(**kwargs):
+        return raw_body
+
+    monkeypatch.setattr(
+        market_data,
+        "authenticate_market_data_request",
+        fake_authentication,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await endpoint(request)
+
+    assert error.value.status_code == 422
+    assert error.value.detail["error"] == (
+        "INVALID_MARKET_DATA"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        market_data.ingest_account,
+        market_data.ingest_positions,
+    ],
+)
+async def test_account_and_positions_unavailable_runtime(
+    monkeypatch,
+    endpoint,
+):
+    patch_runtime_types(monkeypatch)
+
+    request = build_request(
+        market_data_store=object(),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await endpoint(request)
+
+    assert error.value.status_code == 503
+    assert error.value.detail == (
+        "Market-data ingestion is unavailable"
+    )
