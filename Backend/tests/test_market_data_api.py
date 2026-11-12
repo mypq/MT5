@@ -640,3 +640,82 @@ async def test_v2_time_resolution_failure_returns_503(
         == "Broker-time resolution is unavailable"
     )
     assert data_store.saved_messages == []
+
+def test_v2_payload_matches_mt5_connector_contract():
+    payload = build_valid_candles_v2_payload()
+
+    message = market_data.MarketDataBatchV2.model_validate(
+        payload
+    )
+
+    assert message.schema_version == 2
+    assert message.source_id == TEST_SOURCE_ID
+    assert message.symbol == "XAUUSD"
+    assert message.timeframe.value == "M1"
+    assert message.volume_source.value == "TICK"
+
+    for candle in message.candles:
+        assert candle.broker_local_time.tzinfo is None
+        assert candle.is_closed is True
+        assert candle.open > 0
+        assert candle.high >= max(candle.open, candle.close)
+        assert candle.low <= min(candle.open, candle.close)
+        assert candle.tick_volume >= 0
+        assert candle.real_volume >= 0
+        assert candle.spread_points >= 0
+
+
+def test_v2_rejects_timezone_in_broker_local_time():
+    payload = build_valid_candles_v2_payload()
+    payload["candles"][0]["broker_local_time"] = (
+        "2026-11-12T09:00:00Z"
+    )
+
+    with pytest.raises(ValueError):
+        market_data.MarketDataBatchV2.model_validate(
+            payload
+        )
+
+
+def test_v2_rejects_legacy_open_time_field():
+    payload = build_valid_candles_v2_payload()
+    payload["candles"][0]["open_time"] = (
+        "2026-11-12T07:00:00Z"
+    )
+
+    with pytest.raises(ValueError):
+        market_data.MarketDataBatchV2.model_validate(
+            payload
+        )
+
+
+def test_v2_rejects_duplicate_broker_local_times():
+    payload = build_valid_candles_v2_payload()
+    payload["candles"][1]["broker_local_time"] = (
+        payload["candles"][0]["broker_local_time"]
+    )
+
+    with pytest.raises(ValueError):
+        market_data.MarketDataBatchV2.model_validate(
+            payload
+        )
+
+
+def test_v2_rejects_non_chronological_candles():
+    payload = build_valid_candles_v2_payload()
+    payload["candles"].reverse()
+
+    with pytest.raises(ValueError):
+        market_data.MarketDataBatchV2.model_validate(
+            payload
+        )
+
+
+def test_v2_rejects_unsupported_extra_candle_fields():
+    payload = build_valid_candles_v2_payload()
+    payload["candles"][0]["utc_offset_minutes"] = 180
+
+    with pytest.raises(ValueError):
+        market_data.MarketDataBatchV2.model_validate(
+            payload
+        )
