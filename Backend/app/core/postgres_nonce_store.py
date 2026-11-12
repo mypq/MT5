@@ -1,3 +1,4 @@
+
 import asyncio
 import re
 
@@ -12,16 +13,21 @@ class PostgresNonceStore:
     """
     PostgreSQL-backed atomic nonce storage.
 
-    The database table must be initialized before accepting
-    authenticated market-data requests.
-
-    Blocking database operations run in worker threads.
+    Database schema is managed exclusively by Alembic.
+    This class validates the schema and manages nonce records.
     """
 
     _SOURCE_PATTERN = re.compile(r"^[^\r\n]{1,128}$")
     _NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
     _TABLE_NAME = "gold_bot_market_data_nonces"
+
+    _REQUIRED_COLUMNS = {
+        "source_id",
+        "nonce",
+        "expires_at",
+        "created_at",
+    }
 
     def __init__(self, database_url: str) -> None:
         if not isinstance(database_url, str):
@@ -57,36 +63,127 @@ class PostgresNonceStore:
     def _initialize_sync(self) -> None:
         try:
             with self._connect() as connection:
-                connection.execute(
+                columns = connection.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS
-                    gold_bot_market_data_nonces (
-                        source_id VARCHAR(128) NOT NULL,
-                        nonce VARCHAR(128) NOT NULL,
-                        expires_at BIGINT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (source_id, nonce)
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_columns = {
+                    row[0] for row in columns
+                }
+
+                problems = []
+
+                if not actual_columns:
+                    problems.append(
+                        f"Missing table: {self._TABLE_NAME}"
                     )
+                else:
+                    missing = (
+                        self._REQUIRED_COLUMNS
+                        - actual_columns
+                    )
+
+                    if missing:
+                        problems.append(
+                            "Missing nonce columns: "
+                            + ", ".join(sorted(missing))
+                        )
+
+                constraints = connection.execute(
                     """
+                    SELECT conname, contype
+                    FROM pg_constraint
+                    WHERE conrelid = to_regclass(%s)
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_constraints = {
+                    name: constraint_type
+                    for name, constraint_type in constraints
+                }
+
+                if actual_constraints.get(
+                    "gold_bot_market_data_nonces_pkey"
+                ) != "p":
+                    problems.append(
+                        "Missing nonce primary key"
+                    )
+
+                indexes = connection.execute(
+                    """
+                    SELECT
+                        idx.relname,
+                        i.indisvalid,
+                        i.indisready,
+                        pg_get_indexdef(i.indexrelid)
+                    FROM pg_index i
+                    JOIN pg_class idx
+                      ON idx.oid = i.indexrelid
+                    JOIN pg_class tbl
+                      ON tbl.oid = i.indrelid
+                    JOIN pg_namespace ns
+                      ON ns.oid = tbl.relnamespace
+                    WHERE ns.nspname = current_schema()
+                      AND tbl.relname = %s
+                    """,
+                    (self._TABLE_NAME,),
+                ).fetchall()
+
+                actual_indexes = {
+                    row[0]: row[1:]
+                    for row in indexes
+                }
+
+                index = actual_indexes.get(
+                    "idx_market_data_nonces_expires_at"
                 )
 
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_market_data_nonces_expires_at
-                    ON gold_bot_market_data_nonces (expires_at)
-                    """
-                )
+                if index is None:
+                    problems.append(
+                        "Missing nonce expiry index"
+                    )
+                else:
+                    is_valid, is_ready, definition = index
 
+                    if not is_valid or not is_ready:
+                        problems.append(
+                            "Invalid nonce expiry index"
+                        )
+                    elif "expires_at" not in definition:
+                        problems.append(
+                            "Nonce expiry index definition mismatch"
+                        )
+
+                if problems:
+                    raise NonceStoreError(
+                        "Database schema is not migrated correctly. "
+                        "Run alembic upgrade head. Details: "
+                        + "; ".join(problems)
+                    )
+
+        except NonceStoreError:
+            raise
         except Exception as exc:
             raise NonceStoreError(
                 "Unable to initialize PostgreSQL nonce storage"
             ) from exc
 
     async def initialize(self) -> None:
-        """Create the nonce table and expiry index."""
-        await asyncio.to_thread(self._initialize_sync)
+        """
+        Verify the Alembic-managed nonce schema.
+
+        This method never creates or alters database objects.
+        """
+        await asyncio.to_thread(
+            self._initialize_sync
+        )
 
     @classmethod
     def _validate_claim(
@@ -189,7 +286,6 @@ class PostgresNonceStore:
 
         Returns True for a new or expired nonce.
         Returns False if the nonce is already active.
-
         Database failures raise NonceStoreError.
         """
         normalized_source_id = self._validate_claim(
@@ -240,9 +336,6 @@ class PostgresNonceStore:
     ) -> int:
         """
         Delete a limited batch of expired nonce records.
-
-        Call periodically from a managed background task.
-        This method is not executed for every incoming request.
         """
         if (
             isinstance(batch_size, bool)
