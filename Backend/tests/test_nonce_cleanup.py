@@ -190,7 +190,10 @@ async def test_cleanup_errors_do_not_stop_future_cycles(
 
     assert cleanup_calls == 2
     assert sleep_calls == 2
-    assert "Nonce cleanup" in caplog.text
+    assert (
+        "Unexpected nonce cleanup error" in caplog.text
+        or "Nonce cleanup failed" in caplog.text
+    )
 
 
 @pytest.mark.asyncio
