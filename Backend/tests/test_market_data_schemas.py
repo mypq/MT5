@@ -1,4 +1,3 @@
-
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -63,10 +62,12 @@ def valid_account_snapshot() -> dict:
         "account_currency": "USD",
         "balance": 10000.0,
         "equity": 9950.0,
-        "daily_start_equity": 10000.0,
+        "daily_start_equity": None,
+        "daily_start_equity_status": "UNAVAILABLE",
         "free_margin": 9000.0,
         "used_margin": 1000.0,
-        "daily_realized_loss": 50.0,
+        "daily_realized_loss": None,
+        "daily_realized_loss_status": "UNAVAILABLE",
         "positions_count": 1,
         "sent_at": utc_now(),
     }
@@ -83,7 +84,9 @@ def valid_position() -> dict:
         "stop_loss": 2640.0,
         "take_profit": 2670.0,
         "floating_profit": 5.0,
-        "opened_at": utc_now() - timedelta(minutes=5),
+        "opened_at_broker_local": "2026-11-12T09:00:00",
+        "opened_at_utc": None,
+        "time_resolution_status": "UNVERIFIED",
     }
 
 
@@ -210,17 +213,15 @@ def test_position_rejects_zero_volume():
 
 
 def test_positions_snapshot_rejects_duplicate_ids():
-    now = utc_now()
-
     payload = {
         "message_id": str(uuid4()),
         "source_id": "MT5-DEMO-01",
-        "sent_at": now,
+        "sent_at": utc_now(),
         "positions": [
             valid_position(),
             {
                 **valid_position(),
-                "opened_at": now - timedelta(minutes=3),
+                "opened_at_broker_local": "2026-11-12T09:02:00",
             },
         ],
     }
@@ -236,7 +237,10 @@ def test_positions_snapshot_rejects_future_open_time():
     now = utc_now()
 
     position = valid_position()
-    position["opened_at"] = now + timedelta(minutes=1)
+    position["opened_at_utc"] = (
+        now + timedelta(minutes=1)
+    )
+    position["time_resolution_status"] = "VERIFIED"
 
     payload = {
         "message_id": str(uuid4()),
@@ -247,7 +251,7 @@ def test_positions_snapshot_rejects_future_open_time():
 
     with pytest.raises(
         ValidationError,
-        match="after snapshot sent_at",
+        match="opened_at_utc cannot be after snapshot sent_at",
     ):
         OpenPositionsSnapshot.model_validate(payload)
 
@@ -425,3 +429,91 @@ def test_market_batch_v2_rejects_unknown_fields():
 
     with pytest.raises(ValidationError):
         MarketDataBatchV2.model_validate(payload)
+
+
+def test_account_snapshot_accepts_unavailable_daily_metrics():
+    snapshot = AccountSnapshot.model_validate(
+        valid_account_snapshot()
+    )
+
+    assert snapshot.daily_start_equity is None
+    assert snapshot.daily_realized_loss is None
+    assert snapshot.daily_start_equity_status.value == "UNAVAILABLE"
+    assert snapshot.daily_realized_loss_status.value == "UNAVAILABLE"
+
+
+def test_account_snapshot_rejects_available_metric_without_value():
+    payload = valid_account_snapshot()
+    payload["daily_start_equity_status"] = "AVAILABLE"
+
+    with pytest.raises(
+        ValidationError,
+        match="requires a value when AVAILABLE",
+    ):
+        AccountSnapshot.model_validate(payload)
+
+
+def test_account_snapshot_rejects_unavailable_metric_with_value():
+    payload = valid_account_snapshot()
+    payload["daily_realized_loss"] = 50.0
+
+    with pytest.raises(
+        ValidationError,
+        match="must be null when UNAVAILABLE",
+    ):
+        AccountSnapshot.model_validate(payload)
+
+
+def test_account_snapshot_accepts_unverified_metric():
+    payload = valid_account_snapshot()
+    payload["daily_realized_loss"] = 50.0
+    payload["daily_realized_loss_status"] = "UNVERIFIED"
+
+    snapshot = AccountSnapshot.model_validate(payload)
+
+    assert snapshot.daily_realized_loss == 50.0
+    assert snapshot.daily_realized_loss_status.value == "UNVERIFIED"
+
+
+def test_position_accepts_unverified_broker_local_time():
+    position = OpenPosition.model_validate(valid_position())
+
+    assert position.opened_at_broker_local == datetime(
+        2026, 11, 12, 9, 0
+    )
+    assert position.opened_at_utc is None
+    assert position.time_resolution_status.value == "UNVERIFIED"
+
+
+def test_position_rejects_timezone_suffix_in_broker_local_time():
+    payload = valid_position()
+    payload["opened_at_broker_local"] = "2026-11-12T09:00:00Z"
+
+    with pytest.raises(
+        ValidationError,
+        match="without timezone",
+    ):
+        OpenPosition.model_validate(payload)
+
+
+def test_position_rejects_verified_time_without_utc():
+    payload = valid_position()
+    payload["time_resolution_status"] = "VERIFIED"
+
+    with pytest.raises(
+        ValidationError,
+        match="requires opened_at_utc",
+    ):
+        OpenPosition.model_validate(payload)
+
+
+def test_position_rejects_naive_utc_time():
+    payload = valid_position()
+    payload["opened_at_utc"] = "2026-11-12T09:00:00"
+    payload["time_resolution_status"] = "VERIFIED"
+
+    with pytest.raises(
+        ValidationError,
+        match="timezone",
+    ):
+        OpenPosition.model_validate(payload)
