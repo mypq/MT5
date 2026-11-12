@@ -470,3 +470,168 @@ def test_uses_installed_tzdata_database():
     )
 
     assert winter_time.utcoffset() == timedelta(hours=3)
+def make_fetchall_connection(rows):
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = rows
+
+    context = MagicMock()
+    context.__enter__.return_value = connection
+    context.__exit__.return_value = False
+
+    return connection, context
+
+
+@pytest.mark.asyncio
+async def test_resolves_broker_local_time_with_verified_period(
+    store,
+):
+    local_time = datetime(2026, 1, 1, 3, 0)
+
+    start = datetime(
+        2025, 12, 31, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2026, 1, 2, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    _, context = make_fetchall_connection([
+        (start, end, 180),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=local_time,
+        )
+
+    assert result == datetime(
+        2026, 1, 1, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+
+@pytest.mark.asyncio
+async def test_returns_none_without_verified_periods(store):
+    _, context = make_fetchall_connection([])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_candidate_is_outside_period(
+    store,
+):
+    start = datetime(
+        2026, 1, 2, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2026, 1, 3, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    _, context = make_fetchall_connection([
+        (start, end, 180),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_multiple_periods_match(store):
+    start = datetime(
+        2025, 12, 31, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    end = datetime(
+        2026, 1, 2, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    _, context = make_fetchall_connection([
+        (start, end, 180),
+        (start, end, 120),
+    ])
+
+    with patch.object(
+        store,
+        "_connect",
+        return_value=context,
+    ):
+        result = await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_rejects_timezone_aware_broker_local_time(store):
+    aware_time = datetime(
+        2026, 1, 1, 3, 0,
+        tzinfo=timezone.utc,
+    )
+
+    with pytest.raises(
+        MarketTimeStoreError,
+        match="must not contain timezone data",
+    ):
+        await store.resolve_broker_local_time(
+            source_id="MT5-DEMO-01",
+            broker_local_time=aware_time,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejects_invalid_source_id_for_resolution(store):
+    with pytest.raises(MarketTimeStoreError):
+        await store.resolve_broker_local_time(
+            source_id="invalid source",
+            broker_local_time=datetime(2026, 1, 1, 3, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolution_database_failure_raises_store_error(
+    store,
+):
+    with patch.object(
+        store,
+        "_connect",
+        side_effect=RuntimeError("Database unavailable"),
+    ):
+        with pytest.raises(
+            MarketTimeStoreError,
+            match="Unable to resolve broker-local timestamp",
+        ):
+            await store.resolve_broker_local_time(
+                source_id="MT5-DEMO-01",
+                broker_local_time=datetime(2026, 1, 1, 3, 0),
+            )
