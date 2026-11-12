@@ -142,3 +142,45 @@ def test_rejects_non_mapping_candle():
 def test_rejects_string_instead_of_candle_sequence():
     with pytest.raises(IndicatorAnalysisError):
         analyze_indicators("not candles")
+
+
+def test_indicators_match_reference_values():
+    closes = [
+        100.0 + math.sin(i / 3.0)
+        for i in range(80)
+    ]
+
+    candles = []
+
+    for i, close in enumerate(closes):
+        open_price = close + 0.05 * math.cos(i / 2.0)
+
+        candles.append({
+            "open": open_price,
+            "high": max(open_price, close) + 0.35 + (i % 3) * 0.07,
+            "low": min(open_price, close) - 0.28 - (i % 4) * 0.06,
+            "close": close,
+        })
+
+    values = indicator_values(candles)
+
+    expected = {
+        "rsi_14": 66.05992928860223,
+        "macd": 0.10917737603814714,
+        "macd_signal": -0.04418999002931408,
+        "macd_histogram": 0.1533673660674612,
+        "bollinger_upper": 101.4914789109283,
+        "bollinger_middle": 100.05300701160692,
+        "bollinger_lower": 98.61453511228555,
+        "atr_14": 0.8271622798193119,
+        "stochastic_fast_k": 85.19126696340554,
+        "stochastic_k": 83.06840980724819,
+        "stochastic_d": 73.34552999782962,
+    }
+
+    for name, reference in expected.items():
+        assert values[name] == pytest.approx(
+            reference,
+            rel=1e-8,
+            abs=1e-8,
+        )
