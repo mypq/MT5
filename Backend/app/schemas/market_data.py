@@ -1,4 +1,3 @@
-
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
@@ -652,21 +651,11 @@ class MarketDataBatchV2(StrictModel):
 
     @model_validator(mode="after")
     def validate_candle_sequence(self):
-        timestamps = [
-            candle.broker_local_time
-            for candle in self.candles
-        ]
-
-        if timestamps != sorted(timestamps):
-            raise ValueError(
-                "Broker candle times must be ordered chronologically"
-            )
-
-        if len(timestamps) != len(set(timestamps)):
-            raise ValueError(
-                "Duplicate broker candle times are not allowed"
-            )
-
-        # Broker wall-clock time is never compared with UTC sent_at.
-        # Historical UTC conversion requires verified time history.
+        # Broker-local timestamps may repeat or move backwards
+        # during DST transitions or broker clock corrections.
+        #
+        # The original array order is preserved and later stored
+        # as seq_index. It must never be interpreted as UTC order.
+        #
+        # UTC resolution is handled separately by the time resolver.
         return self
