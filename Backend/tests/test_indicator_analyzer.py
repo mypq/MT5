@@ -184,3 +184,137 @@ def test_indicators_match_reference_values():
             rel=1e-8,
             abs=1e-8,
         )
+def test_rejects_boolean_prices():
+    candles = make_candles([100.0] * 60)
+    candles[5]["close"] = True
+
+    with pytest.raises(IndicatorAnalysisError):
+        analyze_indicators(candles)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("open", None),
+        ("high", "invalid"),
+        ("low", float("-inf")),
+        ("close", 0.0),
+        ("close", -10.0),
+    ],
+)
+def test_rejects_missing_or_non_numeric_prices(field, value):
+    candles = make_candles([100.0] * 60)
+    candles[5][field] = value
+
+    with pytest.raises(IndicatorAnalysisError):
+        analyze_indicators(candles)
+
+
+def test_rejects_high_below_low():
+    candles = make_candles([100.0] * 60)
+    candles[5]["high"] = 98.0
+    candles[5]["low"] = 99.0
+
+    with pytest.raises(
+        IndicatorAnalysisError,
+        match="High cannot be below low",
+    ):
+        analyze_indicators(candles)
+
+
+def test_rejects_invalid_candle_low():
+    candles = make_candles([100.0] * 60)
+    candles[5]["low"] = 101.0
+
+    with pytest.raises(
+        IndicatorAnalysisError,
+        match="Invalid candle low",
+    ):
+        analyze_indicators(candles)
+
+
+@pytest.mark.parametrize(
+    "candles",
+    [
+        [],
+        (),
+        "invalid",
+        b"invalid",
+        None,
+        123,
+    ],
+)
+def test_rejects_invalid_candle_collections(candles):
+    with pytest.raises(IndicatorAnalysisError):
+        analyze_indicators(candles)
+
+
+def test_accepts_tuple_of_valid_candles():
+    candles = tuple(make_candles([100.0] * 60))
+
+    result = analyze_indicators(candles)
+
+    assert result["data_available"] is True
+    assert result["candles_analyzed"] == 60
+
+
+def test_result_contains_all_required_metadata():
+    result = analyze_indicators(
+        make_candles([100.0] * 60)
+    )
+
+    assert result["module"] == "indicators"
+    assert result["data_available"] is True
+    assert result["candles_analyzed"] == 60
+
+    assert set(result["indicators"]) == {
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "macd_histogram",
+        "bollinger_upper",
+        "bollinger_middle",
+        "bollinger_lower",
+        "atr_14",
+        "stochastic_fast_k",
+        "stochastic_k",
+        "stochastic_d",
+    }
+
+    assert len(result["observations"]) == 4
+    assert len(result["limitations"]) >= 4
+
+
+def test_flat_market_observations_are_neutral():
+    result = analyze_indicators(
+        make_candles([100.0] * 60)
+    )
+
+    assert "RSI_NEUTRAL_ZONE" in result["observations"]
+    assert "MACD_NEUTRAL" in result["observations"]
+    assert (
+        "PRICE_INSIDE_BOLLINGER_BANDS"
+        in result["observations"]
+    )
+    assert (
+        "STOCHASTIC_NEUTRAL_ZONE"
+        in result["observations"]
+    )
+
+
+def test_rising_market_observations():
+    result = analyze_indicators(
+        make_candles([100.0 + i for i in range(60)])
+    )
+
+    assert "RSI_OVERBOUGHT_ZONE" in result["observations"]
+    assert "MACD_BULLISH" in result["observations"]
+
+
+def test_falling_market_observations():
+    result = analyze_indicators(
+        make_candles([160.0 - i for i in range(60)])
+    )
+
+    assert "RSI_OVERSOLD_ZONE" in result["observations"]
+    assert "MACD_BEARISH" in result["observations"]
