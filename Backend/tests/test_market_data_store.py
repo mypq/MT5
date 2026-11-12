@@ -47,6 +47,15 @@ class FakeCursor:
     def fetchone(self):
         return self.row
 
+    def fetchall(self):
+        if self.row is None:
+            return []
+
+        if isinstance(self.row, list):
+            return self.row
+
+        return [self.row]
+
 
 class FakeConnection:
     def __init__(
@@ -301,7 +310,8 @@ def test_non_postgresql_database_url_is_rejected():
     ):
         MarketDataStore(
             "sqlite:///test.db"
-  )
+        )
+
 
 @pytest.mark.asyncio
 async def test_invalid_source_identifier_is_rejected(monkeypatch):
@@ -478,6 +488,7 @@ def test_non_string_database_url_is_rejected():
         match="Database URL must be a string",
     ):
         MarketDataStore(None)
+
 
 class FakeSchemaConnection:
     def __init__(
