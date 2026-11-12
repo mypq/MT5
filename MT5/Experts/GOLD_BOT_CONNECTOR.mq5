@@ -1,4 +1,8 @@
-
+//+------------------------------------------------------------------+
+//|                                             GoldBotConnector.mq5 |
+//|                                  Copyright 2026, GOLD BOT SYSTEM |
+//|                                             https://YOUR_DOMAIN  |
+//+------------------------------------------------------------------+
 #property strict
 #property version   "1.03"
 #property description "GOLD BOT - DEMO-only XAUUSD market data connector"
@@ -13,6 +17,8 @@ input int InpSendIntervalSeconds = 60;
 input int InpRequestTimeoutMs = 10000;
 
 #define GOLD_BOT_CANDLES_PATH "/api/v1/market-data/candles/v2"
+#define GOLD_BOT_ACCOUNT_PATH "/api/v1/market-data/account"
+#define GOLD_BOT_POSITIONS_PATH "/api/v1/market-data/positions"
 #define GOLD_BOT_MAX_HISTORY 2000
 #define GOLD_BOT_HMAC_BLOCK_SIZE 64
 
@@ -321,6 +327,427 @@ string GetTimeframeName(const ENUM_TIMEFRAMES timeframe)
 }
 
 //+------------------------------------------------------------------+
+//| Sign exact request bytes                                         |
+//+------------------------------------------------------------------+
+bool SignRequest(
+   const string method,
+   const string path,
+   const string timestamp,
+   const string nonce,
+   const uchar &raw_body[],
+   string &signature_hex
+)
+{
+   string canonical =
+      method + "\n" +
+      path + "\n" +
+      timestamp + "\n" +
+      InpSourceId + "\n" +
+      nonce + "\n";
+
+   uchar header_bytes[];
+
+   if(!StringToUtf8Bytes(canonical, header_bytes))
+      return false;
+
+   int header_size = ArraySize(header_bytes);
+   int body_size = ArraySize(raw_body);
+
+   uchar signed_message[];
+
+   ArrayResize(
+      signed_message,
+      header_size + body_size
+   );
+
+   ArrayCopy(
+      signed_message,
+      header_bytes,
+      0,
+      0,
+      header_size
+   );
+
+   if(body_size > 0)
+   {
+      ArrayCopy(
+         signed_message,
+         raw_body,
+         header_size,
+         0,
+         body_size
+      );
+   }
+
+   uchar secret_bytes[];
+
+   if(!StringToUtf8Bytes(InpDeviceSecret, secret_bytes))
+      return false;
+
+   uchar signature[];
+
+   if(!CalculateHmacSha256(
+      secret_bytes,
+      signed_message,
+      signature
+   ))
+      return false;
+
+   signature_hex = BytesToHex(
+      signature,
+      ArraySize(signature)
+   );
+
+   return StringLen(signature_hex) == 64;
+}
+
+//+------------------------------------------------------------------+
+//| Send any authenticated JSON message                              |
+//+------------------------------------------------------------------+
+bool SendAuthenticatedJson(
+   const string path,
+   const string payload,
+   const string message_type
+)
+{
+   uchar raw_body[];
+
+   if(!StringToUtf8Bytes(payload, raw_body))
+   {
+      Print("GOLD BOT: ", message_type, " UTF-8 conversion failed.");
+      return false;
+   }
+
+   string timestamp = IntegerToString((long)TimeGMT());
+   string nonce = CreateRequestToken(32);
+
+   if(StringLen(nonce) != 32)
+      return false;
+
+   string signature;
+
+   if(!SignRequest(
+      "POST",
+      path,
+      timestamp,
+      nonce,
+      raw_body,
+      signature
+   ))
+   {
+      Print("GOLD BOT: ", message_type, " signature failed.");
+      return false;
+   }
+
+   char request_body[];
+   int body_size = ArraySize(raw_body);
+
+   ArrayResize(request_body, body_size);
+
+   for(int i = 0; i < body_size; i++)
+      request_body[i] = (char)raw_body[i];
+
+   string headers =
+      "Content-Type: application/json\r\n" +
+      "X-Device-ID: " + InpSourceId + "\r\n" +
+      "X-Timestamp: " + timestamp + "\r\n" +
+      "X-Nonce: " + nonce + "\r\n" +
+      "X-Signature: " + signature + "\r\n";
+
+   string url = g_backend_url + path;
+
+   char response[];
+   string response_headers;
+
+   ResetLastError();
+
+   int status_code = WebRequest(
+      "POST",
+      url,
+      headers,
+      InpRequestTimeoutMs,
+      request_body,
+      response,
+      response_headers
+   );
+
+   if(status_code == -1)
+   {
+      Print(
+         "GOLD BOT: ",
+         message_type,
+         " WebRequest failed. Error: ",
+         GetLastError()
+      );
+
+      return false;
+   }
+
+   if(status_code == 200)
+   {
+      Print("GOLD BOT: ", message_type, " accepted.");
+      return true;
+   }
+
+   Print(
+      "GOLD BOT: ",
+      message_type,
+      " rejected. HTTP: ",
+      status_code,
+      ". Response: ",
+      CharArrayToString(response, 0, WHOLE_ARRAY, CP_UTF8)
+   );
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Count XAUUSD positions                                           |
+//+------------------------------------------------------------------+
+int CountXauPositions()
+{
+   int count = 0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == InpSymbol)
+         count++;
+   }
+
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Build account snapshot                                           |
+//+------------------------------------------------------------------+
+bool BuildAccountPayload(
+   string &payload,
+   string &message_id
+)
+{
+   message_id = CreateMessageId();
+
+   if(StringLen(message_id) != 36)
+      return false;
+
+   string currency = AccountInfoString(ACCOUNT_CURRENCY);
+
+   if(StringLen(currency) < 3)
+      return false;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double used_margin = AccountInfoDouble(ACCOUNT_MARGIN);
+
+   if(balance < 0 || equity < 0 ||
+      free_margin < 0 || used_margin < 0)
+      return false;
+
+   datetime sent_time = TimeGMT();
+
+   payload =
+      "{\"message_id\":\"" + message_id +
+      "\",\"source_id\":\"" + InpSourceId +
+      "\",\"account_mode\":\"DEMO\"" +
+      ",\"account_currency\":\"" + currency +
+      "\",\"balance\":" + DoubleToString(balance, 8) +
+      ",\"equity\":" + DoubleToString(equity, 8) +
+      ",\"daily_start_equity\":null" +
+      ",\"daily_start_equity_status\":\"UNAVAILABLE\"" +
+      ",\"free_margin\":" + DoubleToString(free_margin, 8) +
+      ",\"used_margin\":" + DoubleToString(used_margin, 8) +
+      ",\"daily_realized_loss\":null" +
+      ",\"daily_realized_loss_status\":\"UNAVAILABLE\"" +
+      ",\"positions_count\":" + IntegerToString(CountXauPositions()) +
+      ",\"sent_at\":\"" + ToUtcIso8601(sent_time) +
+      "\"}";
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Send account snapshot                                            |
+//+------------------------------------------------------------------+
+void SendAccountSnapshot()
+{
+   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(
+      ACCOUNT_TRADE_MODE
+   ) != ACCOUNT_TRADE_MODE_DEMO)
+   {
+      Print("GOLD BOT: Account snapshot blocked. DEMO required.");
+      return;
+   }
+
+   string payload;
+   string message_id;
+
+   if(!BuildAccountPayload(payload, message_id))
+   {
+      Print("GOLD BOT: Account snapshot could not be created.");
+      return;
+   }
+
+   SendAuthenticatedJson(
+      GOLD_BOT_ACCOUNT_PATH,
+      payload,
+      "Account snapshot"
+   );
+}
+
+//+------------------------------------------------------------------+
+//| Build open positions snapshot                                    |
+//+------------------------------------------------------------------+
+bool BuildPositionsPayload(
+   string &payload,
+   string &message_id
+)
+{
+   message_id = CreateMessageId();
+
+   if(StringLen(message_id) != 36)
+      return false;
+
+   payload =
+      "{\"message_id\":\"" + message_id +
+      "\",\"source_id\":\"" + InpSourceId +
+      "\",\"sent_at\":\"" + ToUtcIso8601(TimeGMT()) +
+      "\",\"positions\":[";
+
+   bool first = true;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+
+      // This connector reports XAUUSD positions only.
+      if(symbol != InpSymbol)
+         continue;
+
+      ENUM_POSITION_TYPE position_type =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      string side;
+
+      if(position_type == POSITION_TYPE_BUY)
+         side = "BUY";
+      else if(position_type == POSITION_TYPE_SELL)
+         side = "SELL";
+      else
+         return false;
+
+      double volume =
+         PositionGetDouble(POSITION_VOLUME);
+
+      double entry_price =
+         PositionGetDouble(POSITION_PRICE_OPEN);
+
+      double current_price =
+         PositionGetDouble(POSITION_PRICE_CURRENT);
+
+      double stop_loss =
+         PositionGetDouble(POSITION_SL);
+
+      double take_profit =
+         PositionGetDouble(POSITION_TP);
+
+      double floating_profit =
+         PositionGetDouble(POSITION_PROFIT);
+
+      datetime opened_time =
+         (datetime)PositionGetInteger(POSITION_TIME);
+
+      string stop_loss_json = "null";
+      string take_profit_json = "null";
+
+      if(stop_loss > 0)
+         stop_loss_json = DoubleToString(
+            stop_loss,
+            g_symbol_digits
+         );
+
+      if(take_profit > 0)
+         take_profit_json = DoubleToString(
+            take_profit,
+            g_symbol_digits
+         );
+
+      if(volume <= 0 ||
+         entry_price <= 0 ||
+         current_price <= 0 ||
+         opened_time <= 0)
+         return false;
+
+      if(!first)
+         payload += ",";
+
+      first = false;
+
+      payload +=
+         "{\"position_id\":\"" +
+         IntegerToString((long)ticket) +
+         "\",\"symbol\":\"XAUUSD\"" +
+         ",\"side\":\"" + side +
+         "\",\"volume\":" + DoubleToString(volume, 8) +
+         ",\"entry_price\":" +
+         DoubleToString(entry_price, g_symbol_digits) +
+         ",\"current_price\":" +
+         DoubleToString(current_price, g_symbol_digits) +
+         ",\"stop_loss\":" + stop_loss_json +
+         ",\"take_profit\":" + take_profit_json +
+         ",\"floating_profit\":" +
+         DoubleToString(floating_profit, 8) +
+         ",\"opened_at_broker_local\":\"" +
+         ToBrokerLocalIso8601(opened_time) +
+         "\",\"opened_at_utc\":null" +
+         ",\"time_resolution_status\":\"UNVERIFIED\"}";
+   }
+
+   payload += "]}";
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Send open positions snapshot                                     |
+//+------------------------------------------------------------------+
+void SendOpenPositionsSnapshot()
+{
+   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(
+      ACCOUNT_TRADE_MODE
+   ) != ACCOUNT_TRADE_MODE_DEMO)
+   {
+      Print("GOLD BOT: Positions snapshot blocked. DEMO required.");
+      return;
+   }
+
+   string payload;
+   string message_id;
+
+   if(!BuildPositionsPayload(payload, message_id))
+   {
+      Print("GOLD BOT: Positions snapshot could not be created.");
+      return;
+   }
+
+   SendAuthenticatedJson(
+      GOLD_BOT_POSITIONS_PATH,
+      payload,
+      "Open positions snapshot"
+   );
+}
+
+//+------------------------------------------------------------------+
 //| Build V2 candle JSON payload                                     |
 //+------------------------------------------------------------------+
 bool BuildCandlePayload(string &payload, string &message_id)
@@ -408,81 +835,6 @@ bool BuildCandlePayload(string &payload, string &message_id)
    payload += "]}";
 
    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Sign exact request bytes                                         |
-//+------------------------------------------------------------------+
-bool SignRequest(
-   const string method,
-   const string path,
-   const string timestamp,
-   const string nonce,
-   const uchar &raw_body[],
-   string &signature_hex
-)
-{
-   string canonical =
-      method + "\n" +
-      path + "\n" +
-      timestamp + "\n" +
-      InpSourceId + "\n" +
-      nonce + "\n";
-
-   uchar header_bytes[];
-
-   if(!StringToUtf8Bytes(canonical, header_bytes))
-      return false;
-
-   int header_size = ArraySize(header_bytes);
-   int body_size = ArraySize(raw_body);
-
-   uchar signed_message[];
-
-   ArrayResize(
-      signed_message,
-      header_size + body_size
-   );
-
-   ArrayCopy(
-      signed_message,
-      header_bytes,
-      0,
-      0,
-      header_size
-   );
-
-   if(body_size > 0)
-   {
-      ArrayCopy(
-         signed_message,
-         raw_body,
-         header_size,
-         0,
-         body_size
-      );
-   }
-
-   uchar secret_bytes[];
-
-   if(!StringToUtf8Bytes(InpDeviceSecret, secret_bytes))
-      return false;
-
-   uchar signature[];
-
-   if(!CalculateHmacSha256(
-      secret_bytes,
-      signed_message,
-      signature
-   ))
-      return false;
-
-   signature_hex = BytesToHex(
-      signature,
-      ArraySize(signature)
-   );
-
-   return StringLen(signature_hex) == 64;
 }
 
 //+------------------------------------------------------------------+
@@ -694,8 +1046,8 @@ int OnInit()
       StringLen(g_backend_url) > 0 &&
       StringSubstr(
          g_backend_url,
-         StringLen(g_backend_url) - 1,
-         1
+      StringLen(g_backend_url) - 1,
+      1
       ) == "/"
    )
    {
@@ -726,6 +1078,7 @@ int OnInit()
 
    Print("GOLD BOT: DEMO-only V2 connector initialized.");
    Print("GOLD BOT: Broker-local candle times are sent without UTC conversion.");
+   Print("GOLD BOT: Account and open positions reporting enabled.");
    Print("GOLD BOT: No order-placement functions are enabled.");
 
    return INIT_SUCCEEDED;
@@ -737,6 +1090,8 @@ int OnInit()
 void OnTimer()
 {
    SendCandleBatch();
+   SendAccountSnapshot();
+   SendOpenPositionsSnapshot();
 }
 
 //+------------------------------------------------------------------+
