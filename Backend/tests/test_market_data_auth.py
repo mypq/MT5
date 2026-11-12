@@ -359,3 +359,357 @@ async def test_empty_body_is_rejected():
             device_registry=FakeDeviceRegistry(),
             nonce_store=FakeNonceStore(),
         )
+
+from app.core.device_registry import DeviceRegistryError
+
+
+class BrokenDeviceRegistry:
+    async def get_device_secret(self, source_id):
+        raise DeviceRegistryError("Database unavailable")
+
+
+class BrokenNonceStore:
+    async def claim_nonce(
+        self,
+        source_id,
+        nonce,
+        ttl_seconds,
+    ):
+        raise RuntimeError("Nonce database unavailable")
+
+
+@pytest.mark.asyncio
+async def test_invalid_content_length_is_rejected():
+    request = build_request(
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "invalid",
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="Invalid Content-Length",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_negative_content_length_is_rejected():
+    request = build_request(
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "-1",
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="exceeds the allowed size",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_actual_oversized_body_is_rejected():
+    body = b"x" * (MAX_REQUEST_BODY_BYTES + 1)
+
+    request = build_request(
+        body=body,
+        headers={
+            "Content-Type": "application/json",
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="exceeds the allowed size",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_json_array_is_rejected():
+    body = b'["MT5-DEMO-01"]'
+
+    request = build_request(
+        body=body,
+        headers=signed_headers(body),
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="must be an object",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_json_is_rejected():
+    body = b'{"source_id":"\xff"}'
+
+    request = build_request(
+        body=body,
+        headers=signed_headers(body),
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="valid JSON",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_device_identifier_over_limit_is_rejected():
+    body = json.dumps(
+        {"source_id": "x" * 129}
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers={
+            **signed_headers(body),
+            "X-Device-ID": "x" * 129,
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="Invalid device identifier",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_timestamp_over_limit_is_rejected():
+    body = json.dumps(
+        {"source_id": TEST_SOURCE_ID}
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers={
+            **signed_headers(body),
+            "X-Timestamp": "1" * 13,
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="Invalid request timestamp",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonce_over_limit_is_rejected():
+    body = json.dumps(
+        {"source_id": TEST_SOURCE_ID}
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers={
+            **signed_headers(body),
+            "X-Nonce": "n" * 129,
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="Invalid request nonce",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_signature_wrong_length_is_rejected():
+    body = json.dumps(
+        {"source_id": TEST_SOURCE_ID}
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers={
+            **signed_headers(body),
+            "X-Signature": "abc",
+        },
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="Invalid request signature",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_blank_authentication_header_is_rejected():
+    body = json.dumps(
+        {"source_id": TEST_SOURCE_ID}
+    ).encode()
+
+    headers = signed_headers(body)
+    headers["X-Nonce"] = "   "
+
+    request = build_request(
+        body=body,
+        headers=headers,
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="headers are missing",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_device_registry_failure_is_rejected():
+    body = json.dumps(
+        {
+            "source_id": TEST_SOURCE_ID,
+            "candles": [],
+        }
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers=signed_headers(body),
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="registry is unavailable",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=BrokenDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonce_store_failure_is_rejected():
+    body = json.dumps(
+        {
+            "source_id": TEST_SOURCE_ID,
+            "candles": [],
+        }
+    ).encode()
+
+    request = build_request(
+        body=body,
+        headers=signed_headers(body),
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="authentication failed",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=BrokenNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_modified_signature_is_rejected():
+    body = json.dumps(
+        {
+            "source_id": TEST_SOURCE_ID,
+            "candles": [],
+        }
+    ).encode()
+
+    headers = signed_headers(body)
+    headers["X-Signature"] = (
+        "0" * 64
+        if headers["X-Signature"] != "0" * 64
+        else "1" * 64
+    )
+
+    request = build_request(
+        body=body,
+        headers=headers,
+    )
+
+    with pytest.raises(
+        MarketDataAuthenticationError,
+        match="authentication failed",
+    ):
+        await authenticate_market_data_request(
+            request=request,
+            device_registry=FakeDeviceRegistry(),
+            nonce_store=FakeNonceStore(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_json_content_type_with_charset_is_accepted():
+    body = json.dumps(
+        {
+            "source_id": TEST_SOURCE_ID,
+            "candles": [],
+        }
+    ).encode()
+
+    headers = signed_headers(body)
+    headers["Content-Type"] = (
+        "application/json; charset=utf-8"
+    )
+
+    request = build_request(
+        body=body,
+        headers=headers,
+    )
+
+    result = await authenticate_market_data_request(
+        request=request,
+        device_registry=FakeDeviceRegistry(),
+        nonce_store=FakeNonceStore(),
+    )
+
+    assert result == body
